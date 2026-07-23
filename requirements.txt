@@ -1,0 +1,6 @@
+requests
+pandas
+python-dotenv
+nfl_data_py
+openpyxl
+anthropic

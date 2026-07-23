@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# Data (raw/processed pulls and the DB itself stay local, not in git)
+data/raw/*
+data/processed/*
+data/db/*.sqlite
+data/db/*.db
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/db/.gitkeep
+
+# OS/editor cruft
+.DS_Store
+.vscode/
