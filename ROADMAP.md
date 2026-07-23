@@ -6,7 +6,7 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 
 ---
 
-## Phase 0 — Setup (this week, ~2026-07-23 to 07-27)
+## Phase 0 — Setup (this week, ~2026-07-23 to 07-27) — ✅ DONE (2026-07-23)
 
 **Must Have**
 - Git repo initialized, pushed to GitHub (public), `.gitignore` covering `.env`, `data/db/*.sqlite`, `__pycache__`.

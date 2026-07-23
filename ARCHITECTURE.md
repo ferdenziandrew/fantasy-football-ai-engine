@@ -25,70 +25,15 @@ Everything in Phase 1-2 runs on the free tier. Paid data is a Phase 5+ conversat
 
 **Why Sleeper over ESPN despite Andrew personally playing on ESPN:** this is a data-engineering choice, not a "which app do I play fantasy on" choice. Sleeper's player endpoint is a free, unauthenticated, canonical database of every NFL player with a stable ID — usable regardless of what platform anyone drafts on. ESPN has no equivalent: its fantasy API is unofficial/reverse-engineered (community libraries like `espn-api` on GitHub), and private leagues require scraping `SWID`/`espn_s2` cookies out of a logged-in browser session — extra auth friction for zero benefit here, since we're not pulling *league* data (rosters, scores), we're building a *player* database. `player_id` (Sleeper's ID) is used as the internal primary key across our schema for this reason. If a future feature needs to sync an individual's actual ESPN/Sleeper/Yahoo league (e.g., a trade analyzer using someone's real roster), that's a separate, later concern and would use that platform's API specifically for that user's league.
 
-## Database schema (initial sketch — will evolve in Phase 1)
+## Database schema (finalized 2026-07-23)
 
-```sql
--- players: one row per NFL player
-players (
-  player_id TEXT PRIMARY KEY,   -- Sleeper player_id, used as canonical ID
-  full_name TEXT,
-  position TEXT,                 -- QB, RB, WR, TE, K, DEF
-  team TEXT,                     -- current NFL team abbreviation
-  status TEXT,                   -- active, injured, etc.
-  age INTEGER,
-  years_exp INTEGER
-);
+Source of truth is `scripts/db/schema.sql` — run `py scripts/db/init_db.py` to build/update `data/db/fantasy_football.db` from it. Not duplicated here to avoid the two drifting out of sync; see that file's comments for the full reasoning behind each choice.
 
--- teams: NFL team metadata
-teams (
-  team_abbr TEXT PRIMARY KEY,
-  team_name TEXT,
-  bye_week INTEGER
-);
+Summary of tables: `teams`, `players` (keyed on nflverse's `gsis_id`, with `sleeper_id`/`fantasypros_id`/`espn_id` populated from nflverse's `ff_playerids` crosswalk — see "why Sleeper" note above, same logic applies to matching across all three platforms), `weekly_stats` (raw counting stats, not just fantasy points — needed for the drill-down/color-coded stats view), `season_stats` (a **view**, not a table — derived live from `weekly_stats` so it can't drift out of sync), `snap_counts`, `advanced_stats` (Next Gen Stats — air yards/aDOT, receiving-focused for now), `team_stats` (pace/scoring context, and the denominator for share metrics), `adp`, and `rankings` (Phase 2's own output, including a `blurb_source` column tracking `'andrew'` vs `'claude_drafted'`).
 
--- season_stats: one row per player per season
-season_stats (
-  player_id TEXT,
-  season INTEGER,
-  games_played INTEGER,
-  fantasy_pts_ppr REAL,
-  fantasy_pts_half_ppr REAL,
-  -- raw stat columns: rush_yards, rec_yards, tds, targets, etc.
-  FOREIGN KEY (player_id) REFERENCES players(player_id)
-);
+Deliberately excluded from the schema (compute at query/display time instead of storing): yards per carry, yards per reception, completion percentage, targets per game — all simple division from columns we already have.
 
--- weekly_stats: one row per player per week (needed for recent-form inputs to rankings)
-weekly_stats (
-  player_id TEXT,
-  season INTEGER,
-  week INTEGER,
-  fantasy_pts_ppr REAL,
-  fantasy_pts_half_ppr REAL,
-  -- raw stat columns
-  FOREIGN KEY (player_id) REFERENCES players(player_id)
-);
-
--- adp: current average draft position snapshot (Phase 5 will add historical snapshots)
-adp (
-  player_id TEXT,
-  source TEXT,          -- e.g. 'fantasypros'
-  adp REAL,
-  pulled_at TEXT,        -- ISO timestamp
-  FOREIGN KEY (player_id) REFERENCES players(player_id)
-);
-
--- rankings: output of our own scoring engine (Phase 2)
-rankings (
-  player_id TEXT,
-  scoring_format TEXT,   -- 'ppr' or 'half_ppr'
-  rank INTEGER,
-  score REAL,
-  generated_at TEXT,
-  FOREIGN KEY (player_id) REFERENCES players(player_id)
-);
-```
-
-This will get refined once we're actually pulling real data and see what fields matter — treat this as a starting sketch, not gospel.
+Deliberately deferred to a future version (real complexity, not just extra columns): red zone carries/targets (needs play-by-play aggregation), expected fantasy points (no ready-made source — would need our own model), yards per route run/routes run (only charted since 2022, would leave a historical gap).
 
 ## Repo structure
 
