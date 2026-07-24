@@ -74,8 +74,14 @@ CREATE TABLE IF NOT EXISTS weekly_stats (
     fantasy_points_ppr      REAL,           -- from nflverse directly
     fantasy_points_half_ppr REAL,           -- computed by us: standard + 0.5 * receptions
 
+    target_share            REAL,           -- share of team's targets that week; from nflverse directly
+    wopr                    REAL,           -- weighted opportunity rating (1.5*target_share + 0.7*air_yards_share); from nflverse directly
+
     PRIMARY KEY (gsis_id, season, week)
 );
+-- Note: target_share/wopr were added after weekly_stats already existed in real databases --
+-- see MIGRATIONS in init_db.py, since CREATE TABLE IF NOT EXISTS won't retroactively add
+-- columns to a table that's already there.
 
 CREATE INDEX IF NOT EXISTS idx_weekly_stats_season_week ON weekly_stats(season, week);
 

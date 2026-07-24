@@ -56,6 +56,7 @@ NUMERIC_STAT_COLUMNS = [
     "carries", "rushing_yards", "rushing_tds",
     "receptions", "targets", "receiving_yards", "receiving_tds",
     "fumbles_lost_total", "fantasy_points", "fantasy_points_ppr",
+    "target_share", "wopr",  # 0 = no share of the passing game that week (e.g. a pure rusher)
 ]
 
 
@@ -99,6 +100,8 @@ def build_weekly_rows(df, known_gsis_ids: set) -> list[dict]:
             "fumbles_lost": r.fumbles_lost_total,
             "fantasy_points_ppr": r.fantasy_points_ppr,
             "fantasy_points_half_ppr": fantasy_points_half_ppr,
+            "target_share": r.target_share,
+            "wopr": r.wopr,
         })
     return rows
 
@@ -122,11 +125,13 @@ def upsert_weekly_stats(conn: sqlite3.Connection, rows: list[dict]) -> None:
         INSERT INTO weekly_stats (
             gsis_id, season, week, team, completions, attempts, passing_yards, passing_tds,
             interceptions, carries, rushing_yards, rushing_tds, receptions, targets,
-            receiving_yards, receiving_tds, fumbles_lost, fantasy_points_ppr, fantasy_points_half_ppr
+            receiving_yards, receiving_tds, fumbles_lost, fantasy_points_ppr, fantasy_points_half_ppr,
+            target_share, wopr
         ) VALUES (
             :gsis_id, :season, :week, :team, :completions, :attempts, :passing_yards, :passing_tds,
             :interceptions, :carries, :rushing_yards, :rushing_tds, :receptions, :targets,
-            :receiving_yards, :receiving_tds, :fumbles_lost, :fantasy_points_ppr, :fantasy_points_half_ppr
+            :receiving_yards, :receiving_tds, :fumbles_lost, :fantasy_points_ppr, :fantasy_points_half_ppr,
+            :target_share, :wopr
         )
         ON CONFLICT(gsis_id, season, week) DO UPDATE SET
             team=excluded.team,
@@ -144,7 +149,9 @@ def upsert_weekly_stats(conn: sqlite3.Connection, rows: list[dict]) -> None:
             receiving_tds=excluded.receiving_tds,
             fumbles_lost=excluded.fumbles_lost,
             fantasy_points_ppr=excluded.fantasy_points_ppr,
-            fantasy_points_half_ppr=excluded.fantasy_points_half_ppr
+            fantasy_points_half_ppr=excluded.fantasy_points_half_ppr,
+            target_share=excluded.target_share,
+            wopr=excluded.wopr
         """,
         rows,
     )
