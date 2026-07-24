@@ -33,6 +33,19 @@ CROSSWALK_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/fi
 FANTASY_POSITIONS = {"QB", "RB", "WR", "TE", "K"}  # DEF excluded -- see module docstring
 
 
+def clean_id(value) -> str | None:
+    """Normalizes an ID column that pandas has read as float64 (e.g. 22968.0) back to
+    a clean integer string ("22968"). Any column with even one NaN value forces pandas
+    to read the whole column as float64 -- this bit us for real: fantasypros_id was
+    stored as the literal string '22968.0' instead of '22968', silently breaking every
+    lookup against FantasyPros' API (which returns plain ints) until caught by a 0-match
+    result on a real ingest run. sleeper_id was already normalized this way; this
+    function generalizes it to any ID column with the same float-NaN issue."""
+    if pd.isna(value):
+        return None
+    return str(int(value))
+
+
 def fetch_id_crosswalk() -> dict:
     """Returns {sleeper_id: {gsis_id, fantasypros_id, espn_id}} for every player nflverse tracks.
 
@@ -51,13 +64,11 @@ def fetch_id_crosswalk() -> dict:
 
     crosswalk = {}
     for row in df.itertuples(index=False):
-        # sleeper_id comes through as a float (e.g. 4046.0) in this crosswalk -- normalize
-        # to a plain string so it matches the string keys Sleeper's own API uses.
-        sleeper_id = str(int(row.sleeper_id))
+        sleeper_id = clean_id(row.sleeper_id)
         crosswalk[sleeper_id] = {
             "gsis_id": row.gsis_id,
-            "fantasypros_id": row.fantasypros_id,
-            "espn_id": row.espn_id,
+            "fantasypros_id": clean_id(row.fantasypros_id),
+            "espn_id": clean_id(row.espn_id),
         }
     return crosswalk
 

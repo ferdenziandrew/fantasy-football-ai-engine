@@ -29,6 +29,20 @@ DB_PATH = PROJECT_ROOT / "data" / "db" / "fantasy_football.db"
 MIGRATIONS = [
     ("weekly_stats", "target_share", "REAL"),
     ("weekly_stats", "wopr", "REAL"),
+    ("players", "draft_year", "INTEGER"),
+    ("players", "draft_round", "INTEGER"),
+    ("players", "draft_pick", "INTEGER"),
+    ("weekly_stats", "fg_made_0_39", "INTEGER"),
+    ("weekly_stats", "fg_made_40_49", "INTEGER"),
+    ("weekly_stats", "fg_made_50_plus", "INTEGER"),
+    ("weekly_stats", "fg_missed", "INTEGER"),
+    ("weekly_stats", "pat_made", "INTEGER"),
+    ("weekly_stats", "pat_missed", "INTEGER"),
+    ("rankings", "games_played", "INTEGER"),
+    ("rankings", "floor", "REAL"),
+    ("rankings", "ceiling", "REAL"),
+    ("rankings", "positional_rank", "INTEGER"),
+    ("rankings", "is_rookie_baseline", "INTEGER"),
 ]
 
 

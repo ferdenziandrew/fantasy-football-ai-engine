@@ -56,6 +56,14 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 **Nice to Have**
 - Track which blurbs are "Andrew-written" vs "Claude-drafted, Andrew-approved" (even just a column/flag) — useful later for seeing which blurbs actually perform better with the audience.
 
+**Design note (2026-07-25):** "linked player tabs" (one Excel tab per player) doesn't scale now that we have real data — 855 scored players/rookies would mean 855 tabs. Revised to: one Overview tab (all players, sortable/color-coded) plus one tab per position (QB/RB/WR/TE/K) for the drill-down experience instead. Same two-tier spirit, practical at this volume.
+
+**Known tuning item (2026-07-25):** kickers with very few games are ranking too high relative to established kickers — small positional pool (K) makes VOR swing more easily on a hot small sample. Address during the weights-tuning pass, not now — Andrew's call was to defer, not remove kickers from rankings.
+
+**Cheat sheet shipped (2026-07-25):** `scripts/rankings/cheat_sheet.py` — Overall + position tabs, Tier column (real score gaps, not fixed groups), 2025 season stat columns (Pass/Rush/Rec yards/TDs, Targets, Rec, R+R Yds), full AutoFilter, conditional-formatting-based zebra striping and rookie highlighting (survives sorting, unlike the static-fill version that shipped first). ADP source ended up being Fantasy Football Calculator (free, ~225 players) rather than FantasyPros (free tier caps at 10) — FantasyPros stays available as a second source if the premium tier question resolves in its favor.
+
+**Future potential addition:** VBA macro to auto-highlight whichever column is currently sorted/filtered (Andrew's ask, 2026-07-25). Deferred — requires converting the workbook to macro-enabled `.xlsm` with the security-prompt tradeoffs that come with it. Manual click-to-select-column already works natively in Excel as a no-code stand-in.
+
 **Avoid For Now**
 - Machine learning projection models. A well-reasoned weighted formula is more defensible, more explainable in an interview, and faster to ship.
 

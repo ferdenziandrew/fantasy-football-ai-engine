@@ -2,11 +2,6 @@
 Core rankings engine. Reads weekly_stats, computes a transparent weighted score per
 player, and writes results to the `rankings` table.
 
-Known limitation (not fixed here -- see ROADMAP.md): players with zero weekly_stats
-rows (mainly incoming rookies) get no score at all, since there's nothing to weight.
-Draft capital (import_draft_picks()) is the planned supplementary signal for that gap,
-not yet built.
-
 The formula, in order of what it does to a player's raw weekly point totals:
 
 0. Recency eligibility filter -- players with no games in the last N seasons are
@@ -23,7 +18,13 @@ The formula, in order of what it does to a player's raw weekly point totals:
 3. Opportunity bonus -- players with a high target_share/wopr (underlying role, not
    just results) get a proportional boost, since usage tends to predict future
    production before the box score fully catches up.
-4. Value over replacement (VOR) -- final cross-position ranking is based on how much
+4. Rookie baseline -- this year's draft class (draft_year == REFERENCE_SEASON) has zero
+   weekly_stats by definition (season hasn't happened), so there's nothing to weight.
+   Draft capital substitutes: baseline = positional_avg * a multiplier derived from
+   pick number (see weights_config.py). Restricted to the CURRENT class specifically --
+   an old pick with no stats is just a bust/retired player, not an unproven rookie, and
+   shouldn't get revived with a fake score.
+5. Value over replacement (VOR) -- final cross-position ranking is based on how much
    better a player is than the last realistically-startable player at their position,
    not raw points, since raw points aren't comparable across positions with different
    scarcity.
@@ -44,8 +45,8 @@ from weights_config import WEIGHTS, REPLACEMENT_RANK
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_ROOT / "data" / "db" / "fantasy_football.db"
 
-# The season we're building rankings FOR (hasn't been played yet) -- recency decay and
-# eligibility are measured as distance back from this, not from "today."
+# The season we're building rankings FOR (hasn't been played yet) -- recency decay,
+# eligibility, and "this year's rookie class" are all measured from this.
 REFERENCE_SEASON = 2026
 
 
@@ -90,6 +91,7 @@ def compute_player_aggregates(rows: list[dict], season_max_weeks: dict) -> dict:
             "weight_sum": 0.0,
             "games_played": 0,
             "most_recent_season": r["season"],
+            "is_rookie_baseline": False,
         })
         agg = by_player[r["gsis_id"]]
         w = row_weight(r["season"], r["week"], season_max_weeks)
@@ -114,6 +116,7 @@ def compute_player_aggregates(rows: list[dict], season_max_weeks: dict) -> dict:
             "weighted_avg_wopr": weighted_avg_wopr,
             "floor": statistics.quantiles(sorted_points, n=4)[0] if len(sorted_points) >= 4 else min(sorted_points),
             "ceiling": statistics.quantiles(sorted_points, n=4)[2] if len(sorted_points) >= 4 else max(sorted_points),
+            "is_rookie_baseline": False,
         }
     return results
 
@@ -128,22 +131,24 @@ def filter_eligible_players(aggregates: dict) -> dict:
     }
 
 
-def apply_shrinkage_and_opportunity(aggregates: dict) -> dict:
+def compute_positional_avg(aggregates: dict) -> dict:
+    """Positional baseline computed only from players who meet the games threshold,
+    so small-sample noise doesn't drag down the average it's compared to. Shared by
+    both the shrinkage step and the rookie baseline step."""
+    min_games = WEIGHTS["min_games_for_full_confidence"]
+    by_position: dict = {}
+    for p in aggregates.values():
+        if p["games_played"] >= min_games:
+            by_position.setdefault(p["position"], []).append(p["weighted_avg_points"])
+    return {pos: sum(vals) / len(vals) for pos, vals in by_position.items() if vals}
+
+
+def apply_shrinkage_and_opportunity(aggregates: dict, positional_avg: dict) -> dict:
     """Applies sample-size shrinkage (toward positional average) and the opportunity
     bonus on top of the recency-weighted average, producing each player's raw_score."""
     min_games = WEIGHTS["min_games_for_full_confidence"]
     shrink_strength = WEIGHTS["low_sample_shrinkage_strength"]
     opportunity_weight = WEIGHTS["opportunity_weight"]
-
-    # Positional baseline computed only from players who already meet the games
-    # threshold, so small-sample noise doesn't drag down the average it's compared to.
-    by_position: dict = {}
-    for p in aggregates.values():
-        if p["games_played"] >= min_games:
-            by_position.setdefault(p["position"], []).append(p["weighted_avg_points"])
-    positional_avg = {
-        pos: sum(vals) / len(vals) for pos, vals in by_position.items() if vals
-    }
 
     for p in aggregates.values():
         baseline = positional_avg.get(p["position"], p["weighted_avg_points"])
@@ -157,6 +162,49 @@ def apply_shrinkage_and_opportunity(aggregates: dict) -> dict:
         opportunity_multiplier = 1 + (opportunity_weight * p["weighted_avg_wopr"])
 
         p["raw_score"] = shrunk_points * opportunity_multiplier
+
+    return aggregates
+
+
+def get_rookie_candidates(conn: sqlite3.Connection, aggregates: dict) -> list[dict]:
+    """This year's draft class (draft_year == REFERENCE_SEASON) who aren't already
+    scored -- by definition they have zero weekly_stats, since the season they were
+    drafted for hasn't happened yet."""
+    rows = conn.execute(
+        "SELECT gsis_id, full_name, position, draft_pick FROM players "
+        "WHERE draft_year = ? AND draft_pick IS NOT NULL",
+        (REFERENCE_SEASON,),
+    ).fetchall()
+    return [
+        {"gsis_id": gsis_id, "full_name": full_name, "position": position, "draft_pick": draft_pick}
+        for gsis_id, full_name, position, draft_pick in rows
+        if gsis_id not in aggregates
+    ]
+
+
+def add_rookie_baselines(aggregates: dict, rookies: list[dict], positional_avg: dict) -> dict:
+    scale = WEIGHTS["rookie_draft_capital_scale"]
+    floor = WEIGHTS["rookie_score_floor_multiplier"]
+
+    for r in rookies:
+        baseline = positional_avg.get(r["position"])
+        if baseline is None:
+            continue  # no established players at this position to baseline off of -- skip rather than guess
+
+        multiplier = max(floor, 1 - (r["draft_pick"] - 1) / scale)
+        raw_score = baseline * multiplier
+
+        aggregates[r["gsis_id"]] = {
+            "full_name": r["full_name"],
+            "position": r["position"],
+            "games_played": 0,
+            "weighted_avg_points": raw_score,
+            "weighted_avg_wopr": 0.0,
+            "floor": raw_score,
+            "ceiling": raw_score,
+            "raw_score": raw_score,
+            "is_rookie_baseline": True,
+        }
 
     return aggregates
 
@@ -193,17 +241,28 @@ def write_rankings(conn: sqlite3.Connection, aggregates: dict) -> None:
             "scoring_format": scoring_format,
             "rank": overall_rank,
             "score": p["vor"],
-            "blurb": None,
-            "blurb_source": None,
+            "blurb": "Rookie baseline (draft capital only, no games played yet)" if p["is_rookie_baseline"] else None,
+            "blurb_source": "draft_capital" if p["is_rookie_baseline"] else None,
             "generated_at": generated_at,
+            "games_played": p["games_played"],
+            "floor": p["floor"],
+            "ceiling": p["ceiling"],
+            "positional_rank": p["positional_rank"],
+            "is_rookie_baseline": int(p["is_rookie_baseline"]),
         }
         for overall_rank, (gsis_id, p) in enumerate(ranked, start=1)
     ]
 
     conn.executemany(
         """
-        INSERT INTO rankings (gsis_id, scoring_format, rank, score, blurb, blurb_source, generated_at)
-        VALUES (:gsis_id, :scoring_format, :rank, :score, :blurb, :blurb_source, :generated_at)
+        INSERT INTO rankings (
+            gsis_id, scoring_format, rank, score, blurb, blurb_source, generated_at,
+            games_played, floor, ceiling, positional_rank, is_rookie_baseline
+        )
+        VALUES (
+            :gsis_id, :scoring_format, :rank, :score, :blurb, :blurb_source, :generated_at,
+            :games_played, :floor, :ceiling, :positional_rank, :is_rookie_baseline
+        )
         """,
         rows,
     )
@@ -213,9 +272,10 @@ def print_preview(aggregates: dict, top_n: int = 30) -> None:
     ranked = sorted(aggregates.items(), key=lambda kv: kv[1]["vor"], reverse=True)
     print(f"\n=== Top {top_n} overall (VOR-based) ===")
     for i, (gsis_id, p) in enumerate(ranked[:top_n], start=1):
+        tag = " [ROOKIE]" if p["is_rookie_baseline"] else ""
         print(f"  {i:>3}. {p['full_name']:<25} {p['position']:<3} "
               f"score={p['raw_score']:.1f}  vor={p['vor']:.1f}  "
-              f"floor={p['floor']:.1f}  ceiling={p['ceiling']:.1f}  games={p['games_played']}")
+              f"floor={p['floor']:.1f}  ceiling={p['ceiling']:.1f}  games={p['games_played']}{tag}")
 
     print("\n=== Top 10 per position ===")
     by_position: dict = {}
@@ -225,8 +285,9 @@ def print_preview(aggregates: dict, top_n: int = 30) -> None:
         players = sorted(by_position[position], key=lambda p: p["raw_score"], reverse=True)[:10]
         print(f"\n  -- {position} --")
         for p in players:
+            tag = " [ROOKIE]" if p["is_rookie_baseline"] else ""
             print(f"    {p['positional_rank']:>2}. {p['full_name']:<25} "
-                  f"score={p['raw_score']:.1f}  games={p['games_played']}")
+                  f"score={p['raw_score']:.1f}  games={p['games_played']}{tag}")
 
 
 def main() -> None:
@@ -243,7 +304,13 @@ def main() -> None:
         print(f"{len(aggregates)} players still eligible (played within the last "
               f"{WEIGHTS['eligibility_window_seasons']} seasons)")
 
-        aggregates = apply_shrinkage_and_opportunity(aggregates)
+        positional_avg = compute_positional_avg(aggregates)
+        aggregates = apply_shrinkage_and_opportunity(aggregates, positional_avg)
+
+        rookies = get_rookie_candidates(conn, aggregates)
+        print(f"{len(rookies)} rookies from the {REFERENCE_SEASON} draft class added with a baseline score")
+        aggregates = add_rookie_baselines(aggregates, rookies, positional_avg)
+
         aggregates = compute_vor(aggregates)
 
         print_preview(aggregates)

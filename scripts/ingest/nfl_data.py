@@ -22,11 +22,21 @@ don't trust this blindly if nflverse restructures data again, re-check with a qu
   `recent_team` -> `team`.
 - fumbles_lost is now a single ready-made column, `fumbles_lost_total` -- no more
   summing sack/rushing/receiving fumbles ourselves.
-- fantasy_points_ppr comes directly from nflverse. fantasy_points_half_ppr doesn't --
-  computed here as fantasy_points (standard scoring) + 0.5 * receptions.
+- fantasy_points_ppr comes directly from nflverse for non-kickers. fantasy_points_half_ppr
+  doesn't -- computed here as fantasy_points (standard scoring) + 0.5 * receptions.
 - Numeric stat columns get fillna(0) right after fetching -- NaN is truthy in Python,
   so a plain `x or 0` guard would silently let NaNs through and corrupt any sum built
   from them instead of treating a missing stat as zero.
+
+Kicker scoring (confirmed 2026-07-24, a real gap, not a guess): nflverse's
+fantasy_points/fantasy_points_ppr do NOT include kicking stats at all -- every kicker
+scored exactly 0.0 in scoring.py until this was added. fg_made/pat_made etc. are present
+in the same load_player_stats() data, just never folded into the points total upstream.
+Computed here instead, using Andrew's actual league scoring (confirmed 2026-07-25, not
+a generic default): 3/4/5 pts for FG makes under 40, 40-49, and 50+ yards; 1 pt per PAT
+made; -1 for a missed FG; a missed PAT is 0, not -1 (differs from some common defaults --
+this is deliberate, matches Andrew's real leagues, not an oversight). Since PPR doesn't
+apply to kickers, fantasy_points_ppr and fantasy_points_half_ppr are identical for K rows.
 
 Usage:
     py scripts/ingest/nfl_data.py
@@ -50,6 +60,17 @@ TEAM_ABBR_ALIASES = {
     "LA": "LAR",
 }
 
+# Andrew's actual league scoring (confirmed 2026-07-25) -- a missed PAT is 0, not -1,
+# which differs from some common defaults. Adjust if a different league scores differently.
+KICKER_POINTS = {
+    "fg_0_39": 3,
+    "fg_40_49": 4,
+    "fg_50_plus": 5,
+    "fg_missed": -1,
+    "pat_made": 1,
+    "pat_missed": 0,
+}
+
 # Columns that should be treated as 0, not NaN, when a player didn't do that action that week
 NUMERIC_STAT_COLUMNS = [
     "completions", "attempts", "passing_yards", "passing_tds", "passing_interceptions",
@@ -57,6 +78,8 @@ NUMERIC_STAT_COLUMNS = [
     "receptions", "targets", "receiving_yards", "receiving_tds",
     "fumbles_lost_total", "fantasy_points", "fantasy_points_ppr",
     "target_share", "wopr",  # 0 = no share of the passing game that week (e.g. a pure rusher)
+    "fg_made_0_19", "fg_made_20_29", "fg_made_30_39", "fg_made_40_49", "fg_made_50_59", "fg_made_60_",
+    "fg_missed", "pat_made", "pat_missed",
 ]
 
 
@@ -72,13 +95,36 @@ def fetch_weekly_stats(years: list[int]):
     return df
 
 
+def compute_kicker_points(r) -> float:
+    fg_0_39 = r.fg_made_0_19 + r.fg_made_20_29 + r.fg_made_30_39
+    fg_50_plus = r.fg_made_50_59 + r.fg_made_60_
+    return (
+        fg_0_39 * KICKER_POINTS["fg_0_39"]
+        + r.fg_made_40_49 * KICKER_POINTS["fg_40_49"]
+        + fg_50_plus * KICKER_POINTS["fg_50_plus"]
+        + r.fg_missed * KICKER_POINTS["fg_missed"]
+        + r.pat_made * KICKER_POINTS["pat_made"]
+        + r.pat_missed * KICKER_POINTS["pat_missed"]
+    )
+
+
 def build_weekly_rows(df, known_gsis_ids: set) -> list[dict]:
     df = df[df["player_id"].isin(known_gsis_ids)]
 
     rows = []
     for r in df.itertuples(index=False):
-        fantasy_points_half_ppr = r.fantasy_points + 0.5 * r.receptions
         team = TEAM_ABBR_ALIASES.get(r.team, r.team)
+
+        if r.position == "K":
+            kicker_points = compute_kicker_points(r)
+            fantasy_points_ppr = kicker_points
+            fantasy_points_half_ppr = kicker_points  # PPR doesn't apply to kickers -- same value either way
+        else:
+            fantasy_points_ppr = r.fantasy_points_ppr
+            fantasy_points_half_ppr = r.fantasy_points + 0.5 * r.receptions
+
+        fg_0_39 = r.fg_made_0_19 + r.fg_made_20_29 + r.fg_made_30_39
+        fg_50_plus = r.fg_made_50_59 + r.fg_made_60_
 
         rows.append({
             "gsis_id": r.player_id,
@@ -98,10 +144,16 @@ def build_weekly_rows(df, known_gsis_ids: set) -> list[dict]:
             "receiving_yards": r.receiving_yards,
             "receiving_tds": r.receiving_tds,
             "fumbles_lost": r.fumbles_lost_total,
-            "fantasy_points_ppr": r.fantasy_points_ppr,
+            "fantasy_points_ppr": fantasy_points_ppr,
             "fantasy_points_half_ppr": fantasy_points_half_ppr,
             "target_share": r.target_share,
             "wopr": r.wopr,
+            "fg_made_0_39": fg_0_39,
+            "fg_made_40_49": r.fg_made_40_49,
+            "fg_made_50_plus": fg_50_plus,
+            "fg_missed": r.fg_missed,
+            "pat_made": r.pat_made,
+            "pat_missed": r.pat_missed,
         })
     return rows
 
@@ -126,12 +178,12 @@ def upsert_weekly_stats(conn: sqlite3.Connection, rows: list[dict]) -> None:
             gsis_id, season, week, team, completions, attempts, passing_yards, passing_tds,
             interceptions, carries, rushing_yards, rushing_tds, receptions, targets,
             receiving_yards, receiving_tds, fumbles_lost, fantasy_points_ppr, fantasy_points_half_ppr,
-            target_share, wopr
+            target_share, wopr, fg_made_0_39, fg_made_40_49, fg_made_50_plus, fg_missed, pat_made, pat_missed
         ) VALUES (
             :gsis_id, :season, :week, :team, :completions, :attempts, :passing_yards, :passing_tds,
             :interceptions, :carries, :rushing_yards, :rushing_tds, :receptions, :targets,
             :receiving_yards, :receiving_tds, :fumbles_lost, :fantasy_points_ppr, :fantasy_points_half_ppr,
-            :target_share, :wopr
+            :target_share, :wopr, :fg_made_0_39, :fg_made_40_49, :fg_made_50_plus, :fg_missed, :pat_made, :pat_missed
         )
         ON CONFLICT(gsis_id, season, week) DO UPDATE SET
             team=excluded.team,
@@ -151,7 +203,13 @@ def upsert_weekly_stats(conn: sqlite3.Connection, rows: list[dict]) -> None:
             fantasy_points_ppr=excluded.fantasy_points_ppr,
             fantasy_points_half_ppr=excluded.fantasy_points_half_ppr,
             target_share=excluded.target_share,
-            wopr=excluded.wopr
+            wopr=excluded.wopr,
+            fg_made_0_39=excluded.fg_made_0_39,
+            fg_made_40_49=excluded.fg_made_40_49,
+            fg_made_50_plus=excluded.fg_made_50_plus,
+            fg_missed=excluded.fg_missed,
+            pat_made=excluded.pat_made,
+            pat_missed=excluded.pat_missed
         """,
         rows,
     )

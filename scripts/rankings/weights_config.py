@@ -41,6 +41,13 @@ WEIGHTS = {
     # raw fantasy points. This is what lets the formula catch a player whose role/usage
     # is trending up before their counting stats fully reflect it yet.
     "opportunity_weight": 0.15,
+
+    # --- Rookie baseline (players with zero weekly_stats, this year's draft class only) ---
+    # Draft capital substitutes for performance history: baseline = positional_avg *
+    # multiplier, where multiplier = max(floor, 1 - (pick-1)/scale). Pick 1 at a
+    # position gets close to the full positional average; deep picks approach the floor.
+    "rookie_draft_capital_scale": 250,
+    "rookie_score_floor_multiplier": 0.05,
 }
 
 # Rough replacement-level rank per position, used for value-over-replacement (VOR)

@@ -41,8 +41,14 @@ CREATE TABLE IF NOT EXISTS players (
     height          INTEGER,                -- inches
     weight          INTEGER,                -- lbs
     college         TEXT,
-    years_exp       INTEGER
+    years_exp       INTEGER,
+
+    draft_year      INTEGER,               -- NFL draft year, if drafted
+    draft_round     INTEGER,
+    draft_pick      INTEGER                -- overall pick number
 );
+-- Note: draft_year/draft_round/draft_pick were added after players already existed in
+-- real databases -- see MIGRATIONS in init_db.py.
 
 CREATE INDEX IF NOT EXISTS idx_players_sleeper_id ON players(sleeper_id);
 CREATE INDEX IF NOT EXISTS idx_players_fantasypros_id ON players(fantasypros_id);
@@ -77,11 +83,24 @@ CREATE TABLE IF NOT EXISTS weekly_stats (
     target_share            REAL,           -- share of team's targets that week; from nflverse directly
     wopr                    REAL,           -- weighted opportunity rating (1.5*target_share + 0.7*air_yards_share); from nflverse directly
 
+    -- Kicker-specific: nflverse's fantasy_points_ppr does NOT include kicking stats at
+    -- all (a real gap, not a guess -- confirmed every kicker scored exactly 0 until this
+    -- was added). fantasy_points_ppr/half_ppr for K rows are computed by us from these
+    -- columns instead of trusted from nflverse directly. Distance buckets are combined
+    -- from nflverse's finer 0-19/20-29/30-39/40-49/50-59/60+ split down to the three
+    -- tiers standard kicker scoring actually cares about.
+    fg_made_0_39            INTEGER,
+    fg_made_40_49           INTEGER,
+    fg_made_50_plus         INTEGER,
+    fg_missed               INTEGER,
+    pat_made                INTEGER,
+    pat_missed              INTEGER,
+
     PRIMARY KEY (gsis_id, season, week)
 );
--- Note: target_share/wopr were added after weekly_stats already existed in real databases --
--- see MIGRATIONS in init_db.py, since CREATE TABLE IF NOT EXISTS won't retroactively add
--- columns to a table that's already there.
+-- Note: target_share/wopr/fg_*/pat_* were added after weekly_stats already existed in
+-- real databases -- see MIGRATIONS in init_db.py, since CREATE TABLE IF NOT EXISTS
+-- won't retroactively add columns to a table that's already there.
 
 CREATE INDEX IF NOT EXISTS idx_weekly_stats_season_week ON weekly_stats(season, week);
 
@@ -164,5 +183,16 @@ CREATE TABLE IF NOT EXISTS rankings (
     blurb         TEXT,
     blurb_source  TEXT,                     -- 'andrew' or 'claude_drafted'
     generated_at  TEXT NOT NULL,
+
+    -- Persisted so downstream consumers (e.g. the Excel cheat sheet) don't have to
+    -- re-run scoring.py's whole pipeline just to get context scoring.py already computed.
+    games_played       INTEGER,
+    floor              REAL,
+    ceiling            REAL,
+    positional_rank    INTEGER,
+    is_rookie_baseline INTEGER,             -- 0/1
+
     PRIMARY KEY (gsis_id, scoring_format, generated_at)
 );
+-- Note: games_played/floor/ceiling/positional_rank/is_rookie_baseline were added after
+-- rankings already existed in real databases -- see MIGRATIONS in init_db.py.
