@@ -65,6 +65,34 @@ FantasyFootballProject/
     └── drafts/         — generated content ideas/scripts, pre-publish
 ```
 
+## Environment limitation: never write to data/db/*.db or .git from the sandbox
+
+This folder reaches Claude's sandbox through a virtualized mount that does not reliably
+support the file-locking operations SQLite and git depend on. Writing to the real
+`data/db/fantasy_football.db` from the sandbox while Andrew also has local processes
+touching it (or ever, really) risks silent corruption — this happened once already
+(2026-07-24, "database disk image is malformed", full rebuild required). `git init`
+hit an analogous failure earlier (2026-07-23) for the same underlying reason.
+
+Rule going forward: test all database logic (ingest scripts, upserts, schema changes)
+against a throwaway copy in `/tmp`, never against the real `data/db/fantasy_football.db`.
+Andrew runs the real thing locally. Same logic applies to any git operations.
+
+A related variant hit the same day (2026-07-24): after using the Write tool to update
+`scripts/ingest/nfl_data.py`, the sandbox's bash view of that file was stuck showing a
+stale, truncated copy from an earlier write (confirmed by comparing `wc -l` / a syntax
+check in bash against a Read tool call, which showed the correct full file). A stale
+`__pycache__/*.pyc` next to it caused a separate but related symptom (Python running old
+code after a source edit) because this mount doesn't seem to report file mtimes reliably
+enough for Python's import cache invalidation to trust.
+
+Rule going forward: after editing a script that will immediately be tested via bash in
+the same session, don't assume the Write/Edit tool's view and bash's view agree. Verify
+with a quick `wc -l` / `python3 -m py_compile` in bash before relying on it, and if it
+looks stale, rewrite the file directly from bash (`cat > file << 'EOF' ... EOF`) rather
+than fighting the cache. Always delete `__pycache__` before re-running a script that was
+just edited.
+
 ## Notes for future sessions
 
 - Don't re-ask Andrew about coding split, mentor tone, or automation timing — it's captured above and in memory. Do check in if it seems like the split should shift.

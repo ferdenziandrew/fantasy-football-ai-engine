@@ -1,6 +1,7 @@
 requests
 pandas
+pyarrow
 python-dotenv
-nfl_data_py
+nflreadpy
 openpyxl
 anthropic

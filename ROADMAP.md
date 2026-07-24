@@ -22,9 +22,9 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 ## Phase 1 — Data Foundation (~2026-07-28 to 08-17, 2-3 weeks)
 
 **Must Have**
-- SQLite schema: players, teams, season_stats, weekly_stats, adp (see `ARCHITECTURE.md`).
-- Ingest script: Sleeper API → players + team metadata (free, no auth).
-- Ingest script: nfl_data_py → historical weekly/season stats (2020-2025).
+- ✅ SQLite schema: players, teams, season_stats (view), weekly_stats, snap_counts, advanced_stats, team_stats, adp, rankings (see `ARCHITECTURE.md` and `scripts/db/schema.sql`) — done 2026-07-23.
+- ✅ Ingest script: Sleeper API → players + team metadata (`scripts/ingest/sleeper.py`) — done 2026-07-23, 2,741 fantasy-relevant players loaded.
+- ✅ Ingest script: historical weekly stats, 2020-2025 (`scripts/ingest/nfl_data.py`, via `nflreadpy` — switched from `nfl_data_py`, which is deprecated and missing 2025 data) — done 2026-07-24, 38,054 rows loaded across 2,638 players.
 - Ingest script: FantasyPros → current ADP + expert consensus rankings (once API access is approved).
 - Basic data validation (row counts, null checks) — nothing fancy, just sanity checks.
 
