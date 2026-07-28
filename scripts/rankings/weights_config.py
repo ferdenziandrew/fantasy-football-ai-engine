@@ -35,6 +35,22 @@ WEIGHTS = {
     # 0 = no pulling at all, 1 = fully replaced by the positional average.
     "min_games_for_full_confidence": 8,
     "low_sample_shrinkage_strength": 0.5,
+    # Per-position override for the games threshold above. Added 2026-07-26: kickers
+    # with as few as 8-24 games were outranking established kickers with 90+ games --
+    # the K position has a much smaller, more tightly-scored pool than other positions
+    # (every kicker scores in a narrow band), so VOR swings much more easily on a small,
+    # possibly-lucky sample there than it does at, say, RB or WR. Positions not listed
+    # here just use the plain "min_games_for_full_confidence" value above.
+    "min_games_for_full_confidence_by_position": {
+        "K": 24,
+    },
+    # Same idea, for shrink strength itself: raising the games threshold alone still
+    # leaves a global 0.5 strength, which caps out at only 50% pulled toward the
+    # average even at zero games -- not enough to stop a hot small sample (e.g. 9
+    # games) from still outranking established kickers. K needs a much stronger pull.
+    "low_sample_shrinkage_strength_by_position": {
+        "K": 0.9,
+    },
 
     # --- Opportunity bonus ---
     # How much extra weight underlying opportunity (target_share, wopr) gets on top of
@@ -44,10 +60,22 @@ WEIGHTS = {
 
     # --- Rookie baseline (players with zero weekly_stats, this year's draft class only) ---
     # Draft capital substitutes for performance history: baseline = positional_avg *
-    # multiplier, where multiplier = max(floor, 1 - (pick-1)/scale). Pick 1 at a
-    # position gets close to the full positional average; deep picks approach the floor.
+    # multiplier, where multiplier = min(cap, max(floor, 1 - (pick-1)/scale)). Pick 1 at
+    # a position gets close to the full positional average (subject to the cap below);
+    # deep picks approach the floor.
     "rookie_draft_capital_scale": 250,
     "rookie_score_floor_multiplier": 0.05,
+    # Per-position cap on the multiplier itself (default 1.0 = no cap, i.e. a pick-1
+    # rookie can reach the full positional average). Added 2026-07-26: rookie QBs
+    # (Fernando Mendoza, Ty Simpson) were landing in the real QB1-10 range purely off
+    # high draft capital, which doesn't match reality -- rookie QBs historically have a
+    # much rockier first-year transition than rookie RBs (who often produce
+    # immediately), so the same draft-capital curve shouldn't apply evenly across
+    # positions. Deliberately left at 1.0 (unchanged) for RB/WR/TE/K per Andrew's call
+    # -- examine those positions on their own before adjusting them.
+    "rookie_position_multiplier_cap": {
+        "QB": 0.5,
+    },
 }
 
 # Rough replacement-level rank per position, used for value-over-replacement (VOR)

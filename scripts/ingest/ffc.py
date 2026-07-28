@@ -15,17 +15,20 @@ using both is just a matter of which script you run, not a rebuild.
 
 Matching note: FFC's player_id isn't part of the nflverse ID crosswalk our players
 table uses, so there's no clean ID join here -- matching is done by normalized name
-(lowercased, suffixes/punctuation stripped), with position used as a tiebreaker when
-two players share a normalized name. Defenses (FFC labels these as position "DEF",
-e.g. "Seattle Defense") won't match anything, since our players table doesn't include
-team defenses at all (see sleeper.py) -- expected, not a bug.
+(lowercased, accents stripped, suffixes/punctuation removed), with position used as a
+tiebreaker when two players share a normalized name. Accent-stripping was added
+2026-07-26 after "Eddy Pineiro" (stored without an accent) failed to match FFC's "Eddy
+Piñeiro" (with one) -- a real bug, not an edge case to shrug off, since any accented
+name would have hit the same silent mismatch. Defenses (FFC labels these as position
+"DEF", e.g. "Seattle Defense") won't match anything, since our players table doesn't
+include team defenses at all (see sleeper.py) -- expected, not a bug.
 
 Usage:
     py scripts/ingest/ffc.py
 """
 
-import re
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,11 +45,18 @@ SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 POSITION_ALIASES = {"PK": "K"}
 
 
+def strip_accents(text: str) -> str:
+    """Decomposes accented characters and drops the combining marks, e.g. 'ñ' -> 'n',
+    so a name stored without an accent (or with a different one) still matches."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
 def normalize_name(name: str) -> str:
-    """Lowercases, strips periods/apostrophes, and drops suffixes (Jr./Sr./II/III/IV/V)
-    so e.g. "Michael Pittman Jr." and "Michael Pittman" match, and "Ja'Marr Chase"
-    matches regardless of apostrophe handling on either side."""
-    name = name.lower().replace(".", "").replace("'", "")
+    """Lowercases, strips accents/periods/apostrophes, and drops suffixes
+    (Jr./Sr./II/III/IV/V) so e.g. "Michael Pittman Jr." and "Michael Pittman" match,
+    "Ja'Marr Chase" matches regardless of apostrophe handling, and "Piñeiro" matches
+    "Pineiro" regardless of which side has the accent."""
+    name = strip_accents(name.lower()).replace(".", "").replace("'", "")
     words = [w for w in name.split() if w not in SUFFIXES]
     return " ".join(words)
 

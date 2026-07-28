@@ -50,6 +50,23 @@ DB_PATH = PROJECT_ROOT / "data" / "db" / "fantasy_football.db"
 REFERENCE_SEASON = 2026
 
 
+def get_min_games(position: str) -> int:
+    """Games-played threshold for full confidence, with a per-position override (see
+    weights_config.py -- added for kickers, whose small/tightly-scored positional pool
+    makes VOR swing on a small sample much more easily than at other positions)."""
+    overrides = WEIGHTS.get("min_games_for_full_confidence_by_position", {})
+    return overrides.get(position, WEIGHTS["min_games_for_full_confidence"])
+
+
+def get_shrink_strength(position: str) -> float:
+    """Shrinkage strength with a per-position override -- raising the games threshold
+    alone still leaves the global strength (0.5) capping shrinkage at 50% even at zero
+    games, which wasn't enough to stop a hot 9-game kicker sample from still
+    outranking established kickers. K needs a much stronger pull toward the average."""
+    overrides = WEIGHTS.get("low_sample_shrinkage_strength_by_position", {})
+    return overrides.get(position, WEIGHTS["low_sample_shrinkage_strength"])
+
+
 def load_weekly_rows(conn: sqlite3.Connection) -> list[dict]:
     points_col = "fantasy_points_ppr" if WEIGHTS["scoring_format"] == "ppr" else "fantasy_points_half_ppr"
     cur = conn.execute(f"""
@@ -132,26 +149,43 @@ def filter_eligible_players(aggregates: dict) -> dict:
 
 
 def compute_positional_avg(aggregates: dict) -> dict:
-    """Positional baseline computed only from players who meet the games threshold,
-    so small-sample noise doesn't drag down the average it's compared to. Shared by
-    both the shrinkage step and the rookie baseline step."""
-    min_games = WEIGHTS["min_games_for_full_confidence"]
+    """Positional baseline computed from the top REPLACEMENT_RANK players at each
+    position (the realistically-startable tier), not every player who happens to meet
+    the games threshold. This matters most for the rookie baseline: averaging in every
+    committee back/injury-replacement player who logged enough games (135 RBs met the
+    8-game bar) drags the "average" down toward replacement level itself -- so a
+    rookie getting "99% of the positional average" was really getting ~99% of
+    replacement level. Caught via a real ADP disagreement: Jeremiyah Love, drafted 3rd
+    overall, landed at positional rank 69 with negative VOR under the old (all-players)
+    average -- a 3rd overall pick should score close to a legitimate starter, not
+    below replacement. Using the same startable-tier cutoff VOR already uses keeps the
+    two concepts consistent, and it improves sample-size shrinkage too (a low-sample
+    player now reverts toward "what a good starter does," not "what the median
+    8-games-or-more player does")."""
     by_position: dict = {}
     for p in aggregates.values():
-        if p["games_played"] >= min_games:
+        if p["games_played"] >= get_min_games(p["position"]):
             by_position.setdefault(p["position"], []).append(p["weighted_avg_points"])
-    return {pos: sum(vals) / len(vals) for pos, vals in by_position.items() if vals}
+
+    positional_avg = {}
+    for pos, vals in by_position.items():
+        vals.sort(reverse=True)
+        top_n = REPLACEMENT_RANK.get(pos, len(vals))
+        top_vals = vals[:top_n]
+        if top_vals:
+            positional_avg[pos] = sum(top_vals) / len(top_vals)
+    return positional_avg
 
 
 def apply_shrinkage_and_opportunity(aggregates: dict, positional_avg: dict) -> dict:
     """Applies sample-size shrinkage (toward positional average) and the opportunity
     bonus on top of the recency-weighted average, producing each player's raw_score."""
-    min_games = WEIGHTS["min_games_for_full_confidence"]
-    shrink_strength = WEIGHTS["low_sample_shrinkage_strength"]
     opportunity_weight = WEIGHTS["opportunity_weight"]
 
     for p in aggregates.values():
         baseline = positional_avg.get(p["position"], p["weighted_avg_points"])
+        min_games = get_min_games(p["position"])
+        shrink_strength = get_shrink_strength(p["position"])
         confidence = min(p["games_played"] / min_games, 1.0)
         effective_shrink = shrink_strength * (1 - confidence)
         shrunk_points = p["weighted_avg_points"] * (1 - effective_shrink) + baseline * effective_shrink
@@ -185,13 +219,15 @@ def get_rookie_candidates(conn: sqlite3.Connection, aggregates: dict) -> list[di
 def add_rookie_baselines(aggregates: dict, rookies: list[dict], positional_avg: dict) -> dict:
     scale = WEIGHTS["rookie_draft_capital_scale"]
     floor = WEIGHTS["rookie_score_floor_multiplier"]
+    position_caps = WEIGHTS.get("rookie_position_multiplier_cap", {})
 
     for r in rookies:
         baseline = positional_avg.get(r["position"])
         if baseline is None:
             continue  # no established players at this position to baseline off of -- skip rather than guess
 
-        multiplier = max(floor, 1 - (r["draft_pick"] - 1) / scale)
+        cap = position_caps.get(r["position"], 1.0)
+        multiplier = min(cap, max(floor, 1 - (r["draft_pick"] - 1) / scale))
         raw_score = baseline * multiplier
 
         aggregates[r["gsis_id"]] = {
