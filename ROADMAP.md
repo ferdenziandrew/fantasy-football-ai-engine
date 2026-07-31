@@ -19,14 +19,14 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 
 ---
 
-## Phase 1 — Data Foundation (~2026-07-28 to 08-17, 2-3 weeks)
+## Phase 1 — Data Foundation (~2026-07-28 to 08-17, 2-3 weeks) — ✅ effectively DONE (2026-07-30, well ahead of the 08-17 target)
 
 **Must Have**
 - ✅ SQLite schema: players, teams, season_stats (view), weekly_stats, snap_counts, advanced_stats, team_stats, adp, rankings (see `ARCHITECTURE.md` and `scripts/db/schema.sql`) — done 2026-07-23.
 - ✅ Ingest script: Sleeper API → players + team metadata (`scripts/ingest/sleeper.py`) — done 2026-07-23, 2,741 fantasy-relevant players loaded.
 - ✅ Ingest script: historical weekly stats, 2020-2025 (`scripts/ingest/nfl_data.py`, via `nflreadpy` — switched from `nfl_data_py`, which is deprecated and missing 2025 data) — done 2026-07-24, 38,054 rows loaded across 2,638 players.
-- Ingest script: FantasyPros → current ADP + expert consensus rankings (once API access is approved).
-- Basic data validation (row counts, null checks) — nothing fancy, just sanity checks.
+- ✅ Ingest script: FantasyPros → ADP/expert consensus (`scripts/ingest/fantasypros.py`) — built 2026-07-24, but free tier caps at 10 players, so `ffc.py` (Fantasy Football Calculator) became the primary ADP source instead; FantasyPros stays as a working backup if the paid-tier question ever resolves in its favor.
+- ✅ Basic data validation (`scripts/db/validate.py`) — built 2026-07-24.
 
 **Nice to Have**
 - A small CLI or notebook to query the DB and sanity-check data by eye.
@@ -41,7 +41,20 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 
 ---
 
-## Phase 2 — Rankings Engine + Cheat Sheet (~08-18 to 09-01, targeting pre-draft)
+## Phase 2 — Rankings Engine + Cheat Sheet (~08-18 to 09-01, targeting pre-draft) — nearly DONE as of 2026-07-30, well ahead of schedule
+
+**Status check-in (2026-07-30):** this phase wasn't even supposed to start until 08-18 and it's nearly wrapped on 07-30 — the original Phase 1/2 date split no longer reflects how the work actually happened (in practice they overlapped). Remaining before Phase 2 is genuinely closed out:
+1. RB/WR blurb pass (in progress — QB/TE done 2026-07-30, `content/blurb_worklist_v2.xlsx`).
+2. Build the not-yet-built "load worklist back into `rankings.blurb`/`blurb_source`" script (matched by gsis_id, not name), run it for all four positions, regenerate `cheat_sheet.xlsx` with full blurb coverage.
+3. Quick Half-PPR sanity check — the toggle is wired up in `weights_config.py` but has never actually been run and eyeballed end to end.
+4. One more rankings-vs-ADP review pass (`adp_comparison.py` on real, current data) plus any `weights_config.py` adjustments that surfaces — Andrew's explicit call (2026-07-30) is to prioritize rankings accuracy before moving on, not just ship on schedule.
+
+**Sequencing decision (2026-07-30):** once the four items above are done, move straight into Phase 3 (research digest) rather than waiting for season start as originally planned — the schedule surplus this phase created is deliberately being spent on accuracy (item 4) first, then redirected to start Phase 3 early, not spent on gold-plating Phase 2 further (e.g. extending blurb coverage past WR50/RB40, further tier-threshold tweaking) unless something in the ADP review pass specifically calls for it.
+
+**Off-roadmap additions, queued 2026-07-31 (Claude's suggestions, Andrew agreed to all three):**
+- README.md for the repo (public-facing portfolio pitch, separate from this internal docs set — see the "Git conventions" note in ARCHITECTURE.md, which already flagged this as worth doing "once Phase 2 has a real deliverable to show," which it now does) — started 2026-07-31, no dependency on anything else.
+- Rankings snapshot + diff tool (`scripts/rankings/snapshot_rankings.py` + `rankings_diff.py`) — built 2026-07-31 specifically to support item 4 above (the ADP/tuning review pass): snapshot current rankings + weights before changing `weights_config.py`, then diff against the new run to see who moved and why, rather than eyeballing two full spreadsheets side by side.
+- Pytest regression suite (gsis_id uniqueness, tier-boundary agreement between cheat_sheet.py/blurb_worklist.py, PPR vs Half-PPR actually differing, no orphaned rankings rows) — queued to start once RB/WR blurbs and the load-back script are done, not before. Directly ties to Andrew's QA background/career-transition goal (see CLAUDE.md) — real test-automation discipline applied to this project's own pipeline, not a generic "add tests" task.
 
 **Must Have**
 - Transparent, tunable scoring formula (not ML) that blends: recent performance, ADP/expert consensus, and Andrew's own adjustable weights per stat category.
@@ -73,7 +86,7 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 
 ---
 
-## Phase 3 — Weekly Research Digest + Content Ideas (season start, ~09-01 onward)
+## Phase 3 — Weekly Research Digest + Content Ideas (pulled forward, Andrew's call 2026-07-30 — starts once Phase 2's close-out list above is done, not at season start as originally planned)
 
 **Must Have**
 - Script that pulls weekly news/injuries, summarizes with Claude, flags fantasy-relevant implications.
@@ -110,7 +123,10 @@ Each phase lists: what gets built, what you learn, and the resume/portfolio arti
 - Trade analyzer (compare value of two trade packages using the rankings engine).
 - Multi-platform content repurposing (one digest → YouTube script + IG caption + newsletter blurb).
 - Handcuff rankings (2026-07-26, Andrew's idea, sparked by the ADP outlier review): rank backup RBs specifically by upside-if-the-starter-gets-hurt — factoring in the backup's own passing-game usage, the team's overall quality/pace, and how bad the starter's injury history is. A real, separate ranking dimension from the main board, not something VOR/the main formula should try to fold in.
-- Situational/news context ("camp news," 2026-07-26): the ADP outlier review surfaced real cases (Tyreek Hill's situation, James Conner's backfield competition/team outlook) where the *market* has forward-looking context our stats-only formula structurally cannot have — a season's box score can't know about an offseason injury, a coaching change, or a depth-chart battle. This is NOT a decay-rate/weights fix — no amount of recency tuning solves it, since the information isn't in any historical season at all. The real fix is the Phase 3 research-digest concept (pulls current news, flags fantasy-relevant implications) feeding into the blurb layer as manual overrides/annotations, not a new scoring parameter.
+- Situational/news context ("camp news," 2026-07-26): the ADP outlier review surfaced real cases (Tyreek Hill's situation, James Conner's backfield competition/team outlook) where the *market* has forward-looking context our stats-only formula structurally cannot have — a season's box score can't know about an offseason injury, a coaching change, or a depth-chart battle. This is NOT a decay-rate/weights fix — no amount of recency tuning solves it, since the information isn't in any historical season at all. The real fix is the Phase 3 research-digest concept (pulls current news, flags fantasy-relevant implications) feeding into the blurb layer as manual overrides/annotations, not a new scoring parameter. Sourcing decision (2026-07-28): X/Twitter's API moved to pay-per-use in 2026 with no free tier at all (even the old $200/mo Basic tier is closed to new signups) — not a good fit for automated ingestion. Free RSS feeds (RotoWire/RotoBaller injury and player-news feeds) are the better source for the automated digest; X stays useful as something Andrew personally browses for camp-reporter color that feeds his own blurb-writing, not something to build scraping infrastructure around.
+- Betting markets as a signal (2026-07-28, Andrew's idea): use sportsbook lines — team win totals, game spreads/totals (implied team scoring environment), and player props (anytime TD odds, yardage overs/unders) — to help project expected season/weekly output. Markets are widely regarded as one of the sharpest available signals precisely for things our formula can't see from box scores alone (team quality, game script expectations, role certainty) — directly relevant to gaps already found (e.g. the James Conner/team-outlook case). Worth scoping as its own data source once picked up (odds APIs, which team/player, which markets to pull) rather than a quick bolt-on.
+- Offensive line quality tracking (2026-07-28, Andrew's idea): track O-line rankings/quality (in-season performance metrics, or preseason projections) as a signal feeding QB and RB projections specifically — pass-block quality affects QB opportunity/sack avoidance, run-block quality affects RB efficiency directly — and eventually defense projections too, once the team-defense data model above exists (O-line quality is also a factor in the opposing side's matchup difficulty). PFF O-line grades are the standard signal here but sit behind PFF's paid tier; check free alternatives (e.g. ESPN's pass-block/run-block win rate) first. Scope as its own data source when picked up, not a quick bolt-on.
+- Backtest validation (2026-07-31, Claude's suggestion, Andrew agreed): build rankings using only 2020-2024 data, then check how they'd have actually performed against real 2025 season outcomes (e.g. Spearman correlation between pre-season projected rank and actual season-end fantasy finish). This is the strongest possible answer to "why should anyone trust this formula" — directly serves the "rankings need to be genuinely defensible" goal stated elsewhere in this doc — but it's nontrivial (need a defensible scoring-of-the-scorer method, and scoring.py would need a "pretend today is August 2025" mode). Explicitly deferred: Andrew's call was not to start this until Phase 3 (research digest) is proven out, not before.
 
 **Known minor data-quality quirk (2026-07-26):** a small number of very recent/late-round players get a synthetic (non-gsis_id) placeholder ID from nflverse-adjacent sources when they don't have an official ID assigned yet, and different sources (the ID crosswalk vs. draft picks data) can synthesize *different* placeholders for the same real person — found via "Mike Washington Jr.," who has two separate `players` rows (`WAS569019` from Sleeper's crosswalk, `WAS797326` from draft_picks.py) that are almost certainly the same guy. Doesn't affect rankings today (only the row with draft info qualifies for scoring), so not worth building entity-resolution for one player — revisit if this shows up more as more rookie classes get ingested.
 
