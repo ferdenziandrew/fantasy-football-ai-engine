@@ -6,7 +6,7 @@ A transparent, from-scratch fantasy football rankings and cheat-sheet generator,
 
 Most public "fantasy rankings" are either a spreadsheet someone eyeballed or the output of an opaque model nobody can interrogate. This project is neither: it's a SQLite database of real historical NFL performance, current ADP, and rookie draft capital, fed into a fully parametrized value-over-replacement (VOR) scoring formula — every weight is a named constant in a config file, not a hidden coefficient. If a player's rank looks wrong, the answer to "why" is always traceable to a specific number in `weights_config.py`, not "the model said so."
 
-The output is a formatted Excel cheat sheet: one Overall tab (every scored player, ranked and tiered) plus one tab per position (QB/RB/WR/TE/K) for the drill-down view, each with real season stats, per-game rate columns, tier-based color coding, and short "why" blurbs explaining context a stats-only formula structurally can't see (coaching changes, depth-chart battles, injury history).
+The output is a formatted Excel cheat sheet: one Overall tab (every scored player, ranked and tiered) plus one tab per position (QB/RB/WR/TE/K) for the drill-down view, each with real season stats, per-game rate columns, tier-based color coding, and short "why" Notes explaining context a stats-only formula structurally can't see (coaching changes, depth-chart battles, injury history).
 
 ## How the rankings actually work
 
@@ -24,7 +24,7 @@ The output is a formatted Excel cheat sheet: one Overall tab (every scored playe
 | Storage | SQLite (schema in `scripts/db/schema.sql`) |
 | Data sources | Sleeper API (player IDs/metadata), nflverse via `nflreadpy` (historical weekly stats), Fantasy Football Calculator (current ADP), nflverse draft data (rookie draft capital) |
 | Export | openpyxl (formatted Excel, conditional formatting, tiering) |
-| AI | Anthropic API — used for blurb drafting and, eventually, the weekly research digest |
+| AI | Anthropic API — used for Notes drafting and, eventually, the weekly research digest |
 
 No ML projection models — a transparent weighted formula is more explainable, easier to debug, and (so far) just as defensible as a black box.
 
@@ -47,7 +47,10 @@ scripts/
 │   ├── scoring.py           # the VOR scoring engine itself
 │   ├── cheat_sheet.py        # generates the formatted Excel cheat sheet
 │   ├── adp_comparison.py     # flags biggest our-rank-vs-market-ADP disagreements
-│   └── blurb_worklist.py    # generates an editable worksheet for writing "why" blurbs
+│   ├── blurb_worklist.py    # generates an editable worksheet for writing "why" Notes
+│   ├── load_blurbs.py        # loads approved Notes back into rankings.blurb/blurb_source
+│   ├── snapshot_rankings.py  # saves current rankings + weights before a tuning change
+│   └── rankings_diff.py      # diffs a snapshot against the current rankings/weights
 └── content/                  # Phase 3+ — weekly research digest, content ideas
 ```
 
@@ -71,6 +74,6 @@ py scripts/rankings/cheat_sheet.py # export the formatted Excel cheat sheet -> c
 
 ## Status / what's next
 
-Data pipeline and scoring engine are built and tuned; the Excel cheat sheet (Overall + position tabs, tiers, per-game rate stats, conditional formatting, rookie/ADP-outlier flags) is shipped and in active use. Player "why" blurbs are being written position by position. Next up: a weekly research digest that pulls current news/injuries and flags fantasy-relevant implications, feeding into the blurb layer as the season starts. See `ROADMAP.md` for the full phased plan.
+Data pipeline and scoring engine are built and tuned; the Excel cheat sheet (Overall + position tabs, tiers, per-game rate stats, conditional formatting, rookie/ADP-outlier flags) is shipped and in active use, with "why" Notes written for QB/RB/WR/TE's top players. Next up: a final rankings-vs-ADP accuracy pass, then a weekly research digest that pulls current news/injuries and flags fantasy-relevant implications, feeding into the Notes as the season starts. See `ROADMAP.md` for the full phased plan.
 
 This is an actively developed personal project — expect the schema and scoring weights to keep evolving as more seasons of real usage validate (or challenge) the methodology.
