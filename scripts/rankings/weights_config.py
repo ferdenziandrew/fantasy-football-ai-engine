@@ -51,6 +51,18 @@ WEIGHTS = {
     "low_sample_shrinkage_strength_by_position": {
         "K": 0.9,
     },
+    # A player below THIS many games is excluded from scoring entirely (not just
+    # heavily shrunk) -- distinct from min_games_for_full_confidence above, which
+    # controls how STRONGLY a low-sample player gets pulled toward the positional
+    # average, not whether they're scored at all. Added 2026-08-24: Phil Mafah (1 game,
+    # a Week 18 finale where teams commonly rest starters and backups get run) still
+    # shrunk toward the positional AVERAGE -- a generous prior for a player we know
+    # almost nothing about -- landing him at "barely above replacement" (RB24) instead
+    # of near the bottom, where a genuinely unproven player belongs. A 1-2 game sample
+    # is closer to no information than to "this guy is roughly average," so below this
+    # threshold a player is dropped rather than scored with a false sense of confidence.
+    "min_games_to_score": 2,
+    "min_games_to_score_by_position": {},  # per-position override, same pattern as above -- none needed yet
 
     # --- Opportunity bonus ---
     # How much extra weight underlying opportunity (target_share, wopr) gets on top of

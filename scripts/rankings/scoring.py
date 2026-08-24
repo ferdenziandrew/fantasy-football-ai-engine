@@ -4,13 +4,30 @@ player, and writes results to the `rankings` table.
 
 The formula, in order of what it does to a player's raw weekly point totals:
 
-0. Recency eligibility filter -- players with no games in the last N seasons are
+0a. Recency eligibility filter -- players with no games in the last N seasons are
    dropped entirely before scoring (almost certainly retired/out of the league). This
    has to be a hard filter, not a decay factor baked into the weighted average below --
    averaging cancels out any constant per-player scale factor, so two players with
    identical stats from different (internally uniform) seasons would otherwise score
    identically no matter how strong the decay rate is. Caught this via a test comparing
    an identical stat line in 2025 vs. 2020, which should NOT have scored the same.
+0b. Current-roster filter -- players with no current NFL team (players.current_team IS
+   NULL: free agents, retired, unsigned) are dropped too, separately from the recency
+   filter above. Recency alone isn't enough: a player can have great, RECENT stats
+   (within the eligibility window) and still not be on any roster right now -- caught
+   via a real case, Joe Mixon, who ranked RB8 overall despite being a free agent who
+   missed all of 2025, because nothing in the pipeline checked current roster status at
+   all, only recency of play. Applied BEFORE compute_positional_avg/VOR, not just at
+   the end, so a strong-but-unrostered player's score can't inflate the positional
+   average or replacement-level baseline that OTHER (actually rosterable) players get
+   compared against.
+0c. Min-games-to-score filter -- players below min_games_to_score (default 2) are
+   dropped entirely too, distinct from the shrinkage-strength handling in step 2 below.
+   Caught via a real case, Phil Mafah: a single Week 18 game (commonly a rest-your-
+   starters week) still got shrunk toward the positional AVERAGE, which is a generous
+   prior for a player we know almost nothing about -- landing him at barely-above-
+   replacement (RB24) instead of near the bottom where a genuinely unproven 1-game
+   sample belongs. Applied in the same place and for the same reason as 0b.
 1. Recency-weighted average -- within an eligible player's own game log, recent
    seasons/weeks count more than old ones.
 2. Sample-size shrinkage -- players with few games get pulled toward their positional
@@ -67,10 +84,19 @@ def get_shrink_strength(position: str) -> float:
     return overrides.get(position, WEIGHTS["low_sample_shrinkage_strength"])
 
 
+def get_min_games_to_score(position: str) -> int:
+    """Games-played floor BELOW which a player is excluded from scoring entirely, with
+    a per-position override -- see weights_config.py's note on why this is a separate
+    concept from get_min_games (that one controls shrinkage STRENGTH; this one controls
+    whether the player is scored at all)."""
+    overrides = WEIGHTS.get("min_games_to_score_by_position", {})
+    return overrides.get(position, WEIGHTS["min_games_to_score"])
+
+
 def load_weekly_rows(conn: sqlite3.Connection) -> list[dict]:
     points_col = "fantasy_points_ppr" if WEIGHTS["scoring_format"] == "ppr" else "fantasy_points_half_ppr"
     cur = conn.execute(f"""
-        SELECT w.gsis_id, p.position, p.full_name, w.season, w.week,
+        SELECT w.gsis_id, p.position, p.full_name, p.current_team, w.season, w.week,
                w.{points_col} AS points, w.target_share, w.wopr
         FROM weekly_stats w
         JOIN players p ON w.gsis_id = p.gsis_id
@@ -102,6 +128,7 @@ def compute_player_aggregates(rows: list[dict], season_max_weeks: dict) -> dict:
         by_player.setdefault(r["gsis_id"], {
             "full_name": r["full_name"],
             "position": r["position"],
+            "current_team": r["current_team"],
             "points_list": [],
             "weighted_points_sum": 0.0,
             "weighted_wopr_sum": 0.0,
@@ -127,6 +154,7 @@ def compute_player_aggregates(rows: list[dict], season_max_weeks: dict) -> dict:
         results[gsis_id] = {
             "full_name": agg["full_name"],
             "position": agg["position"],
+            "current_team": agg["current_team"],
             "games_played": agg["games_played"],
             "most_recent_season": agg["most_recent_season"],
             "weighted_avg_points": weighted_avg_points,
@@ -145,6 +173,35 @@ def filter_eligible_players(aggregates: dict) -> dict:
     return {
         gsis_id: p for gsis_id, p in aggregates.items()
         if p["most_recent_season"] >= cutoff
+    }
+
+
+def filter_current_roster(aggregates: dict) -> dict:
+    """Drops players with no current NFL team -- free agents, retired, unsigned. A
+    separate, additional filter from recency eligibility above: a player can have
+    strong RECENT stats and still not be on any roster right now (see module docstring
+    -- caught via Joe Mixon ranking RB8 overall as an unrostered free agent). Applied
+    before compute_positional_avg/VOR so an unrostered player's score can't inflate the
+    baseline that actually-rosterable players get compared against."""
+    return {
+        gsis_id: p for gsis_id, p in aggregates.items()
+        if p.get("current_team")
+    }
+
+
+def filter_min_games_to_score(aggregates: dict) -> dict:
+    """Drops players below get_min_games_to_score(position) -- a 1-2 game sample is
+    closer to no information than to "roughly average" (see module docstring and
+    weights_config.py's note on the Phil Mafah case: a single Week 18 game, commonly a
+    rest-your-starters week, still got shrunk toward the positional AVERAGE rather than
+    excluded, landing him at barely-above-replacement instead of near the bottom where a
+    genuinely unproven player belongs). Applied in the same place as filter_current_roster
+    and for the same reason -- before compute_positional_avg/VOR, so an artificially
+    average-anchored score from a token sample can't distort the baseline everyone else
+    is compared against."""
+    return {
+        gsis_id: p for gsis_id, p in aggregates.items()
+        if p["games_played"] >= get_min_games_to_score(p["position"])
     }
 
 
@@ -203,10 +260,12 @@ def apply_shrinkage_and_opportunity(aggregates: dict, positional_avg: dict) -> d
 def get_rookie_candidates(conn: sqlite3.Connection, aggregates: dict) -> list[dict]:
     """This year's draft class (draft_year == REFERENCE_SEASON) who aren't already
     scored -- by definition they have zero weekly_stats, since the season they were
-    drafted for hasn't happened yet."""
+    drafted for hasn't happened yet. Also requires a current_team (rare, but a
+    drafted rookie who was waived/cut before the season shouldn't get a fake baseline
+    score either -- same reasoning as filter_current_roster above)."""
     rows = conn.execute(
         "SELECT gsis_id, full_name, position, draft_pick FROM players "
-        "WHERE draft_year = ? AND draft_pick IS NOT NULL",
+        "WHERE draft_year = ? AND draft_pick IS NOT NULL AND current_team IS NOT NULL",
         (REFERENCE_SEASON,),
     ).fetchall()
     return [
@@ -339,6 +398,14 @@ def main() -> None:
         aggregates = filter_eligible_players(aggregates)
         print(f"{len(aggregates)} players still eligible (played within the last "
               f"{WEIGHTS['eligibility_window_seasons']} seasons)")
+
+        aggregates = filter_current_roster(aggregates)
+        print(f"{len(aggregates)} players still eligible after dropping free agents/unsigned "
+              f"(no current NFL team)")
+
+        aggregates = filter_min_games_to_score(aggregates)
+        print(f"{len(aggregates)} players still eligible after dropping token/1-2-game samples "
+              f"(below min_games_to_score)")
 
         positional_avg = compute_positional_avg(aggregates)
         aggregates = apply_shrinkage_and_opportunity(aggregates, positional_avg)
