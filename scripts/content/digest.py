@@ -110,8 +110,10 @@ Usage:
 """
 
 import json
+import re
 import sqlite3
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -125,6 +127,11 @@ DB_PATH = PROJECT_ROOT / "data" / "db" / "fantasy_football.db"
 OUTPUT_DIR = PROJECT_ROOT / "content" / "drafts"
 HISTORY_PATH = PROJECT_ROOT / "data" / "processed" / "digest_history.json"
 VALIDATION_LOG_PATH = PROJECT_ROOT / "data" / "processed" / "digest_validation_log.xlsx"
+# v17 (2026-09-03, Andrew's ask after a real Excel-lock crash lost 5 rows): if
+# wb.save() below can't get the file (Andrew has it open), the run's regular rows
+# are queued here instead of lost -- see the v17 note in append_validation_log's
+# docstring for the full design.
+VALIDATION_LOG_PENDING_PATH = PROJECT_ROOT / "data" / "processed" / "digest_validation_log_pending.json"
 
 # Reuse the ingest layer's proven name-matching logic rather than duplicating it.
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "ingest"))
@@ -348,9 +355,15 @@ def summarize_with_claude(client: Anthropic, group: dict, prior_entries: list[di
         f"report (flashing potential, impressing in a joint practice, one good outing) is NOT enough on its "
         f"own to flag UP -- that's noise until it's corroborated. Check the prior status below: if this is "
         f"the first report of this kind for this player, impact should be NEUTRAL even with POSITIVE tone; "
-        f"only flag UP once there's a pattern -- e.g. this is the 2nd or 3rd consecutive positive report, or "
-        f"something more concrete than camp buzz (a depth chart listing, a snap-count/target-share number, "
-        f"a coach naming him the starter, a contract/trade). PRESEASON GAME participation needs "
+        f"only flag UP if EITHER of these is true, independently -- neither needs the other: (1) this is "
+        f"the 3rd consecutive positive report for this situation with no negative reports in between, or "
+        f"(2) something concrete enough that no repetition is needed at all -- a depth chart listing, a "
+        f"snap-count/target-share number, a coach or team naming him the new starter, a role opening up to "
+        f"him because of a teammate's injury or departure, or a contract/trade. Condition (2) qualifies for "
+        f"UP on the very first report, regardless of any prior history for this player. When UP fires "
+        f"because of condition (1) rather than (2), say so directly in the summary -- e.g. \"third straight "
+        f"positive camp report\" -- so it's clear from the row alone why this is being treated as real "
+        f"signal instead of noise. PRESEASON GAME participation needs "
         f"judgment, not a blanket rule -- a clear veteran starter resting in a preseason game is routine, "
         f"NEUTRAL, not a signal either way. But a roster-bubble/competition player being deliberately held "
         f"out with language like 'they've seen enough' or 'earned a roster spot' IS a real signal (usually "
@@ -366,14 +379,36 @@ def summarize_with_claude(client: Anthropic, group: dict, prior_entries: list[di
         f"UP/DOWN. Only flag a new UP/DOWN if something has genuinely changed or escalated since the prior "
         f"status.\n"
         f"4. A long-term flag: YES if this news indicates a season-ending injury, IR placement, or an "
-        f"absence of 4+ weeks; NO otherwise.\n\n"
+        f"absence of 4+ weeks; NO otherwise.\n"
+        f"5. An event-driven flag: YES if this is grounded in something that actually happened or was "
+        f"said by someone inside the team -- an injury, a practice/game status change, a roster or "
+        f"depth-chart move, a transaction, or a quote from a coach, coordinator, GM, or the player "
+        f"himself about his role, health, or outlook (coach/insider commentary counts as actionable even "
+        f"without a hard event behind it -- e.g. a coach saying a player looks like his best self this "
+        f"time of year is real signal). NO if this is outside media/analyst commentary with no "
+        f"organizational quote behind it -- a fantasy analyst's season-outlook or redraft-value opinion "
+        f"piece. Default to YES when genuinely unsure -- missing real news is worse than including a "
+        f"borderline item.\n\n"
+        f"6. A new-information flag: NEW_INFORMATION: YES if this report adds anything materially "
+        f"new since the prior status below -- an escalation, a resolution, a genuinely different "
+        f"detail, or the first time this kind of news has come up. NO if this is substantially the "
+        f"same underlying event as the prior status, even if it's worded very differently, comes "
+        f"from a different source, or has more/less detail -- judge by substance, not exact "
+        f"wording. A report describing the same practice session, workout, game, or status update "
+        f"the prior entry already covers is NO even if the wording is only ~90% different or none "
+        f"of it overlaps at all. Default to YES when genuinely unsure, same principle as the "
+        f"event-driven flag above -- missing a real update is worse than one redundant entry. This "
+        f"is a TRIAL field (added 2026-09-02) -- logged and shown on the sheet but not yet used to "
+        f"suppress anything.\n\n"
         f"{history_text}\n\n"
         f"News:\n{items_text}\n\n"
         f"Respond in exactly this format:\n"
         f"SUMMARY: <one sentence>\n"
         f"TONE: <POSITIVE, NEGATIVE, or NEUTRAL>\n"
         f"IMPACT: <UP, DOWN, NEUTRAL, or PENDING>\n"
-        f"LONG_TERM: <YES or NO>"
+        f"LONG_TERM: <YES or NO>\n"
+        f"EVENT_DRIVEN: <YES or NO>\n"
+        f"NEW_INFORMATION: <YES or NO>"
     )
 
     response = client.messages.create(
@@ -387,6 +422,15 @@ def summarize_with_claude(client: Anthropic, group: dict, prior_entries: list[di
 def parse_claude_response(group: dict, text: str) -> dict:
     """Split out so the parsing logic can be tested without a real API call."""
     summary, tone, impact, long_term = "", "NEUTRAL", "NEUTRAL", False
+    # Lenient default (2026-08-27, Andrew's ask): an unparseable/missing EVENT_DRIVEN
+    # line should never silently demote a real item into the opinion section -- only an
+    # explicit "NO" does that.
+    event_driven = True
+    # NEW_INFORMATION (2026-09-02, trial field): same lenient-default philosophy --
+    # missing/malformed defaults to YES (treat as new) so nothing is ever silently
+    # hidden by a parsing gap. Not yet used to suppress rows (see append_validation_log
+    # docstring) -- logged on the sheet only, pending Andrew's ~1-week trust review.
+    new_information = True
     for line in text.splitlines():
         if line.startswith("SUMMARY:"):
             summary = line[len("SUMMARY:"):].strip()
@@ -396,7 +440,184 @@ def parse_claude_response(group: dict, text: str) -> dict:
             impact = line[len("IMPACT:"):].strip().upper()
         elif line.startswith("LONG_TERM:"):
             long_term = line[len("LONG_TERM:"):].strip().upper() == "YES"
-    return {**group, "summary": summary or text.strip(), "tone": tone, "impact": impact, "long_term": long_term}
+        elif line.startswith("EVENT_DRIVEN:"):
+            event_driven = line[len("EVENT_DRIVEN:"):].strip().upper() != "NO"
+        elif line.startswith("NEW_INFORMATION:"):
+            new_information = line[len("NEW_INFORMATION:"):].strip().upper() != "NO"
+    return {**group, "summary": summary or text.strip(), "tone": tone, "impact": impact,
+            "long_term": long_term, "event_driven": event_driven, "new_information": new_information}
+
+
+BATCH_STATIC_INSTRUCTIONS = (
+    "You're a fantasy football analyst. Below are several players, each under its own "
+    "'### PLAYER <N>' marker with their name/position/team, prior known status, and today's "
+    "news. For EACH player, independently write:\n"
+    "1. A one-sentence fantasy-relevant summary (what a fantasy manager needs to know).\n"
+    "2. A news tone flag: POSITIVE, NEGATIVE, or NEUTRAL -- how the story itself is framed, "
+    "independent of whether it actually changes his fantasy value.\n"
+    "3. A ranking impact flag: UP, DOWN, NEUTRAL, or PENDING -- does this actually change his "
+    "fantasy value. Positive news doesn't always mean UP (e.g. a good quote about a player who's "
+    "already a clear starter is POSITIVE tone but NEUTRAL impact). A SINGLE positive camp/practice "
+    "report (flashing potential, impressing in a joint practice, one good outing) is NOT enough on its "
+    "own to flag UP -- that's noise until it's corroborated. Check the prior status given: if this is "
+    "the first report of this kind for this player, impact should be NEUTRAL even with POSITIVE tone; "
+    "only flag UP if EITHER of these is true, independently -- neither needs the other: (1) this is "
+    "the 3rd consecutive positive report for this situation with no negative reports in between, or "
+    "(2) something concrete enough that no repetition is needed at all -- a depth chart listing, a "
+    "snap-count/target-share number, a coach or team naming him the new starter, a role opening up to "
+    "him because of a teammate's injury or departure, or a contract/trade. Condition (2) qualifies for "
+    "UP on the very first report, regardless of any prior history for this player. When UP fires "
+    "because of condition (1) rather than (2), say so directly in the summary -- e.g. \"third straight "
+    "positive camp report\" -- so it's clear from the row alone why this is being treated as real "
+    "signal instead of noise. PRESEASON GAME participation needs "
+    "judgment, not a blanket rule -- a clear veteran starter resting in a preseason game is routine, "
+    "NEUTRAL, not a signal either way. But a roster-bubble/competition player being deliberately held "
+    "out with language like 'they've seen enough' or 'earned a roster spot' IS a real signal (usually "
+    "UP -- it implies the team has already decided in his favor) -- the distinguishing question is "
+    "WHY he didn't play: standard rest for someone whose role is already settled = no signal; a "
+    "decision reflecting the team's actual evaluation of a player whose role is still being decided = "
+    "real signal. Use PENDING, not a premature DOWN, when something concerning is reported but "
+    "genuinely undiagnosed yet -- e.g. 'being looked at by trainers' or 'left with an issue' with no "
+    "diagnosis or missed-time estimate given. Don't assume worst case; wait for the actual diagnosis "
+    "before committing to DOWN. IMPORTANT: check the prior status given first -- if this news is just "
+    "an expected continuation of something already known (e.g. a routine practice absence for an "
+    "injury already reported as DOWN), the impact should usually be NEUTRAL, not a repeat of the same "
+    "UP/DOWN. Only flag a new UP/DOWN if something has genuinely changed or escalated since the prior "
+    "status.\n"
+    "4. A long-term flag: YES if this news indicates a season-ending injury, IR placement, or an "
+    "absence of 4+ weeks; NO otherwise.\n"
+    "5. An event-driven flag: YES if this is grounded in something that actually happened or was "
+    "said by someone inside the team -- an injury, a practice/game status change, a roster or "
+    "depth-chart move, a transaction, or a quote from a coach, coordinator, GM, or the player "
+    "himself about his role, health, or outlook (coach/insider commentary counts as actionable even "
+    "without a hard event behind it -- e.g. a coach saying a player looks like his best self this "
+    "time of year is real signal). NO if this is outside media/analyst commentary with no "
+    "organizational quote behind it -- a fantasy analyst's season-outlook or redraft-value opinion "
+    "piece. Default to YES when genuinely unsure -- missing real news is worse than including a "
+    "borderline item.\n\n"
+    "6. A new-information flag: NEW_INFORMATION: YES if this report adds anything materially "
+    "new since the prior status given -- an escalation, a resolution, a genuinely different "
+    "detail, or the first time this kind of news has come up. NO if this is substantially the "
+    "same underlying event as the prior status, even if it's worded very differently, comes "
+    "from a different source, or has more/less detail -- judge by substance, not exact "
+    "wording. A report describing the same practice session, workout, game, or status update "
+    "the prior entry already covers is NO even if the wording is only ~90% different or none "
+    "of it overlaps at all. Default to YES when genuinely unsure, same principle as the "
+    "event-driven flag above -- missing a real update is worse than one redundant entry. This "
+    "is a TRIAL field (added 2026-09-02) -- logged and shown on the sheet but not yet used to "
+    "suppress anything.\n\n"
+    "Treat each player completely independently -- do not let one player's news influence another "
+    "player's classification, even if they're on the same team.\n\n"
+    "Respond with exactly one block per player, in the SAME ORDER given below, each starting with "
+    "that player's own marker line exactly as given, in this exact format:\n"
+    "### PLAYER <N>\n"
+    "SUMMARY: <one sentence>\n"
+    "TONE: <POSITIVE, NEGATIVE, or NEUTRAL>\n"
+    "IMPACT: <UP, DOWN, NEUTRAL, or PENDING>\n"
+    "LONG_TERM: <YES or NO>\n"
+    "EVENT_DRIVEN: <YES or NO>\n"
+    "NEW_INFORMATION: <YES or NO>\n"
+)
+
+PLAYER_MARKER_RE = re.compile(r"^###\s*PLAYER\s+(\d+)\s*$", re.MULTILINE)
+
+
+def _build_player_block(index: int, group: dict, prior_entries: list[dict]) -> str:
+    """The per-player portion of a batch prompt -- same content summarize_with_claude
+    sends for one player (name/position/team, prior status, news items), labeled with
+    an index so the batched response can be split back apart per player."""
+    items_text = "\n\n".join(
+        f"[{i}] ({it['source']}) {it['headline']}\n{it['description']}"
+        for i, it in enumerate(group["items"], start=1)
+    )
+    multiple_note = (
+        "\n(Multiple reports of the same underlying story above -- synthesize them into ONE "
+        "summary, don't just restate one and ignore the rest.)"
+        if len(group["items"]) > 1 else ""
+    )
+    history_text = format_history_for_prompt(prior_entries)
+    return (
+        f"### PLAYER {index}\n"
+        f"Player: {group['full_name']} ({group['position']}, {group['team'] or 'no current team'})\n"
+        f"{history_text}\n\n"
+        f"News:\n{items_text}{multiple_note}"
+    )
+
+
+def parse_batch_response(groups: list[dict], text: str) -> dict[int, dict]:
+    """Splits a batched response back into one parsed result per player, keyed by the
+    1-based index used in the prompt. Reuses parse_claude_response per block so the same
+    lenient field-level defaults apply. Indices missing from the response (bad split, or
+    Claude skipped one) are simply absent from the returned dict -- the caller is
+    responsible for falling back to an individual call for any that are missing."""
+    results: dict[int, dict] = {}
+    parts = PLAYER_MARKER_RE.split(text)
+    # re.split with a capturing group yields [pre-text, idx1, block1, idx2, block2, ...]
+    for i in range(1, len(parts), 2):
+        try:
+            idx = int(parts[i])
+        except ValueError:
+            continue
+        if 1 <= idx <= len(groups):
+            results[idx] = parse_claude_response(groups[idx - 1], parts[i + 1])
+    return results
+
+
+def summarize_batch_with_claude(client: Anthropic, groups: list[dict], history: dict) -> list[dict]:
+    """v14 (2026-09-02, Andrew's ask, cost reduction): one Claude call for every matched
+    player in the run instead of one call per player -- the instruction block above only
+    gets sent once instead of N times, roughly halving cost. (Prompt caching was the
+    first idea, but Haiku 4.5 requires a 4,096-token minimum cacheable prefix and this
+    instruction block is well under that -- caching would silently do nothing at this
+    prompt's size, confirmed against Anthropic's docs before building this instead.)
+    Never silently drops a player: falls back to the original one-call-per-player
+    summarize_with_claude for any player whose block is missing from the batch response,
+    or for everyone in the batch if the response was truncated (max_tokens hit, so we
+    can't trust where any block actually ended)."""
+    if not groups:
+        return []
+    prior_entries_list = [history.get(g["gsis_id"], {}).get("entries", []) for g in groups]
+    prompt = BATCH_STATIC_INSTRUCTIONS + "\n\n" + "\n\n".join(
+        _build_player_block(i, g, pe)
+        for i, (g, pe) in enumerate(zip(groups, prior_entries_list), start=1)
+    )
+    max_tok = min(4096, max(500, 120 * len(groups) + 200))
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tok,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text
+    results_by_index: dict[int, dict] = {}
+    if response.stop_reason == "max_tokens":
+        print(f"  Batch response hit max_tokens ({max_tok}) -- discarding, falling back to "
+              f"individual calls for all {len(groups)} player(s)")
+    else:
+        results_by_index = parse_batch_response(groups, text)
+
+    missing = [i for i in range(1, len(groups) + 1) if i not in results_by_index]
+    if missing and results_by_index:
+        # Partial miss (not a full-batch discard above) -- name the players so a gap is
+        # visible in the run log, not just a silent count.
+        missing_names = ", ".join(groups[i - 1]["full_name"] for i in missing)
+        print(f"  Batch response missing {len(missing)} player(s) ({missing_names}) -- "
+              f"falling back to individual calls for just those")
+    for i in missing:
+        results_by_index[i] = summarize_with_claude(client, groups[i - 1], prior_entries_list[i - 1])
+
+    return [results_by_index[i] for i in range(1, len(groups) + 1)]
+
+
+def _headline_signature(items: list[dict]) -> str:
+    """Stable fingerprint of the raw source headlines behind a classification -- sorted
+    so item order (which can vary run to run even for the identical set) doesn't matter.
+    v13 (2026-09-01, Andrew's ask): the same top RSS item can still be the newest thing in
+    the feed across two runs close together (e.g. a 7 AM and 1 PM pull with nothing new in
+    between). Re-classifying identical text can come back with a slightly different
+    impact/tone purely from LLM non-determinism -- caught this directly when two manual
+    test runs 44 seconds apart on IDENTICAL headlines produced Malik Nabers as PENDING once
+    and NEUTRAL the next, writing a spurious duplicate row for nothing."""
+    return "|".join(sorted(it["headline"] for it in items))
 
 
 def is_change(result: dict, history: dict) -> bool:
@@ -408,6 +629,12 @@ def is_change(result: dict, history: dict) -> bool:
     if not prior_entries:
         return True
     last = prior_entries[-1]
+    # v13: same source headline(s) as last time -- not a real change no matter what impact/
+    # tone this pass came back with (see _headline_signature docstring). Old history entries
+    # predate this field and have no "headline_signature" key, so this simply never matches
+    # for them and falls through to the normal comparison below -- no migration needed.
+    if last.get("headline_signature") == _headline_signature(result["items"]):
+        return False
     return last["impact"] != result["impact"] or last["tone"] != result["tone"]
 
 
@@ -426,7 +653,18 @@ def update_history(history: dict, results: list[dict], today_str: str) -> dict:
         record["entries"].append({
             "date": today_str, "impact": r["impact"], "tone": r["tone"],
             "summary": r["summary"], "long_term": r.get("long_term", False),
+            "event_driven": r.get("event_driven", True),
+            "headline_signature": _headline_signature(r["items"]),
         })
+        if r["impact"] == "PENDING":
+            # v10 (2026-08-28, Andrew's ask -- fewer/less noisy reminders): a player
+            # who's freshly PENDING today (whether this is a brand new entry or an
+            # updated one) already got surfaced today via the regular "What's new"
+            # section -- an immediate reminder the SAME day is a redundant duplicate of
+            # information Andrew just saw. Marking today as already-alerted here means
+            # get_pending_reminders() won't also fire for them today; reminders now
+            # start the day AFTER a player goes (or stays) PENDING with no further news.
+            record["last_pending_alert_date"] = today_str
     return history
 
 
@@ -451,34 +689,68 @@ def get_pending_reminders(history: dict, today_str: str) -> list[dict]:
     return reminders
 
 
+def _format_player_blocks(entries: list[dict]) -> list[str]:
+    """Shared block formatter (arrow, impact/tone header, summary, source links) for one
+    player -- used by both the 'What's new' and 'Analyst takes' sections in write_report
+    (added 2026-08-27 alongside EVENT_DRIVEN) so the two sections share formatting
+    instead of duplicating it."""
+    lines = []
+    for r in entries:
+        arrow = IMPACT_ARROWS.get(r["impact"], "?")
+        team = r["team"] or "no current team"
+        long_term_tag = " [long-term]" if r.get("long_term") else ""
+        lines.append(f"### [{arrow}] {r['full_name']} ({r['position']}, {team}) -- "
+                     f"Impact: {r['impact']} | Tone: {r['tone']}{long_term_tag}")
+        lines.append(r["summary"])
+        source_links = ", ".join(f"[*{it['headline']}*]({it['link']}) ({it['source']})" for it in r["items"])
+        lines.append(f"Sources: {source_links}")
+        lines.append("")
+    return lines
+
+
 def write_report(changes: list[dict], pending_reminders: list[dict], date_str: str) -> Path | None:
     if not changes and not pending_reminders:
         return None
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / f"digest_{date_str}.md"
+    if out_path.exists():
+        # v12 (2026-08-31, Andrew's ask -- running more than once a day): the first run of
+        # a day keeps the plain digest_YYYY-MM-DD.md name (unchanged from before, so a normal
+        # single-run day looks exactly like it always has). A second-or-later run the SAME day
+        # previously overwrote that file outright, silently losing an earlier run's report --
+        # now it gets its own HHMM-suffixed file instead, so nothing from an earlier run today
+        # disappears.
+        out_path = OUTPUT_DIR / f"digest_{date_str}_{datetime.now().strftime('%H%M')}.md"
 
     lines = [f"# Research Digest -- {date_str}", ""]
 
     if changes:
         changes = sorted(changes, key=lambda r: IMPACT_ORDER.get(r["impact"], 4))
-        source_counts: dict = {}
-        for r in changes:
-            for it in r["items"]:
-                source_counts[it["source"]] = source_counts.get(it["source"], 0) + 1
-        source_summary = ", ".join(f"{count} from {source}" for source, count in source_counts.items())
-        lines.append(f"## What's new ({len(changes)} players, {sum(source_counts.values())} items: {source_summary})")
-        lines.append("")
-        for r in changes:
-            arrow = IMPACT_ARROWS.get(r["impact"], "?")
-            team = r["team"] or "no current team"
-            long_term_tag = " [long-term]" if r.get("long_term") else ""
-            lines.append(f"### [{arrow}] {r['full_name']} ({r['position']}, {team}) -- "
-                         f"Impact: {r['impact']} | Tone: {r['tone']}{long_term_tag}")
-            lines.append(r["summary"])
-            source_links = ", ".join(f"[*{it['headline']}*]({it['link']}) ({it['source']})" for it in r["items"])
-            lines.append(f"Sources: {source_links}")
+        # v9 (2026-08-27, Andrew's ask): split items with no real event or team-insider
+        # quote behind them (a media outlet's season-outlook/redraft-value opinion
+        # piece -- e.g. rotoballer's "could follow his career year" pieces) out of
+        # "What's new" into their own section below. Demoted, not dropped -- a wrong
+        # EVENT_DRIVEN call should never hide real news. See the EVENT_DRIVEN criteria
+        # in summarize_with_claude's prompt (a coach/insider quote counts as YES even
+        # with no hard event behind it -- Andrew's Ben Johnson example).
+        event_changes = [r for r in changes if r.get("event_driven", True)]
+        opinion_changes = [r for r in changes if not r.get("event_driven", True)]
+
+        if event_changes:
+            source_counts: dict = {}
+            for r in event_changes:
+                for it in r["items"]:
+                    source_counts[it["source"]] = source_counts.get(it["source"], 0) + 1
+            source_summary = ", ".join(f"{count} from {source}" for source, count in source_counts.items())
+            lines.append(f"## What's new ({len(event_changes)} players, {sum(source_counts.values())} items: {source_summary})")
             lines.append("")
+            lines.extend(_format_player_blocks(event_changes))
+
+        if opinion_changes:
+            lines.append(f"## Analyst takes ({len(opinion_changes)} players -- not event-driven, FYI only)")
+            lines.append("")
+            lines.extend(_format_player_blocks(opinion_changes))
 
     if pending_reminders:
         lines.append("## Still pending from earlier")
@@ -496,6 +768,7 @@ def write_report(changes: list[dict], pending_reminders: list[dict], date_str: s
 VALIDATION_LOG_FIELDNAMES = [
     "date", "player", "position", "team", "impact", "tone", "long_term",
     "summary", "headlines", "correct", "andrew_notes", "override_impact", "override_tone",
+    "event_driven", "new_information",
 ]
 
 # Andrew's preferred column widths (2026-08-25 ask, tightened further 2026-08-26 so
@@ -506,10 +779,15 @@ VALIDATION_LOG_COLUMN_WIDTHS = {
     "date": 12, "player": 12, "position": 5, "team": 5, "impact": 9, "tone": 8,
     "long_term": 7, "summary": 20, "headlines": 55, "correct": 6,
     "andrew_notes": 45, "override_impact": 14, "override_tone": 12,
+    "event_driven": 8,  # rightmost column (Andrew's ask, 2026-08-27) -- keeps the
+    # existing screen-fit layout intact rather than inserting it mid-sheet
+    "new_information": 8,  # TRIAL column, 2026-09-02 -- Andrew's ask is to revisit in
+    # ~1 week whether this (and event_driven/long_term) are trusted enough to stop
+    # needing a visible column at all; see append_validation_log's NEW_INFORMATION note
 }
 
 
-def append_validation_log(changes: list[dict], pending_reminders: list[dict], date_str: str) -> int:
+def append_validation_log(changes: list[dict], pending_reminders: list[dict], date_str: str, history: dict) -> int:
     """Appends every reported entry to a persistent Excel workbook
     (data/processed/digest_validation_log.xlsx) for Andrew to review after reading the
     markdown report. Columns beyond the core data are all his to fill in: `correct`
@@ -536,65 +814,311 @@ def append_validation_log(changes: list[dict], pending_reminders: list[dict], da
     "what fraction of PENDING calls were actually correct" becomes an answerable
     question once there's enough of this, not just a vibe. Appends across runs into
     ONE file (not one file per day) specifically so it accumulates into something
-    analyzable, rather than being scattered across many small files."""
+    analyzable, rather than being scattered across many small files.
+
+    v9 (2026-08-27, Andrew's ask -- try it, revert if it doesn't feel right):
+    - EVERY write now re-sorts the whole sheet so all "(reminder)" rows sit at the true
+      bottom, not just the bottom of that run's own batch (running the digest more than
+      once a day was leaving an earlier run's reminders sandwiched between run
+      batches). This is a full read-everything/rebuild pass -- existing rows are read
+      back by VALUE and rewritten -- so any formatting Andrew has added BEYOND what
+      this function manages (fills, date format, column widths are all reapplied
+      automatically) will NOT survive, e.g. manually bolding a cell or adding a custom
+      color. Worth knowing before deciding whether to keep this.
+    - A live "needs review" conditional-formatting highlight on non-reminder rows where
+      `correct` is still blank -- tracks Andrew's edits automatically in Excel itself,
+      no extra script run needed to clear the highlight once he fills a row in.
+    - A hard-stop data validation on override_impact/override_tone that rejects typing
+      a value into those cells on a reminder row, since the grey fill alone hasn't
+      stopped that mistake from recurring.
+
+    v10 (2026-08-28, Andrew's ask -- pending reminders were "confusing and noisy"):
+    get_pending_reminders() still fires once per calendar day per still-PENDING player
+    (unchanged -- the daily markdown "Still pending from earlier" section still wants
+    that), but this function no longer turns every one of those into a NEW row. A
+    reminder row is now upserted per player instead of appended: if that player already
+    has an open "(reminder)" row, its summary/date are refreshed in place (Andrew's
+    correct/andrew_notes/override_* on that row are left untouched -- his prior
+    annotation stays attached to the current row rather than getting orphaned under a
+    fresh blank duplicate); only a player with no existing open reminder row gets a
+    brand new one. A reminder row's `date` is now the story's since_date (when this
+    status was last substantively true) rather than the day the row happened to be
+    (re)written, and the redundant "(pending since <date>)" text is dropped from the
+    summary since the date column now carries that -- also makes the date column
+    filterable/sortable by staleness, which it wasn't before. One-time migration: any
+    player with MULTIPLE existing "(reminder)" rows (an artifact of the old
+    once-a-day-forever behavior) gets collapsed to one on the first v10 run, keeping
+    whichever duplicate has the most of Andrew's own content (correct/andrew_notes/
+    override_*) and refreshing its summary/date to the most recent of the group.
+    Known limitation, accepted rather than engineered around: matching is by player
+    name only, not by story identity -- if a player has a fully-resolved PENDING
+    episode and, much later, a brand new unrelated one, the new one would upsert onto
+    the old (dormant) reminder row instead of getting a fresh one. Not worth the added
+    complexity (a gsis_id + history lookup) for how unlikely that is to happen within a
+    single preseason.
+
+    v11 (2026-08-31, Andrew's ask after seeing v10 run for real): two follow-ups once he
+    saw actual orphaned rows and a real name collision.
+    (1) Auto-clear: a reminder row now requires the player's CURRENT history status to
+    still be PENDING or it is dropped entirely on the next write (this needs `history`,
+    hence the new parameter -- `pending_reminders` alone can't tell "still pending, not
+    re-alerted today" apart from "resolved, no longer pending at all"). Andrew's explicit
+    choice over archiving to a separate section or leaving it manual -- he accepted that a
+    note/override on a row that resolves is gone with it, not preserved anywhere.
+    (2) Collision flag: a fresh regular row (in `changes`) for a player who ALSO still has
+    an open reminder row gets a bolded "[Already has an open reminder]" prefix on its
+    summary (rich text, via openpyxl's CellRichText/TextBlock) -- Andrew's own wording, kept
+    short on purpose since he already knows to use the player-column filter to go find the
+    matching grey row, so the prefix doesn't repeat instructions he's already been told.
+
+    v16 (2026-09-02, TRIAL, Andrew's ask -- found via a real Malik Nabers row that got
+    re-logged a second time with softened impact instead of being recognized as the same
+    underlying practice session already covered): NEW_INFORMATION is a new Claude-judged
+    field (see the prompt's rule 6) -- YES if a report adds anything materially new since
+    the player's prior status, NO if it's substantially the same event just worded
+    differently. It is ONLY logged as a column right now (`new_information`, rightmost) --
+    NOT used to suppress a row. Andrew's explicit call: skipping straight to silent
+    suppression removes his ability to catch a bad call by looking at the sheet, the same
+    way the collision-flag self-reference bug (above) and the v13 duplicate-row bug were
+    both caught by him noticing something off in a visible row. Plan: after roughly a
+    week of real runs, have a short discussion on whether NEW_INFORMATION's judgment has
+    proven reliable enough to actually start suppressing NO rows -- and, at the same time,
+    whether `long_term` and `event_driven` (both older, already-trusted columns) have
+    proven reliable enough that they no longer need to be visible columns Andrew reviews
+    row by row either. Nothing about long_term/event_driven's behavior changes today --
+    this is purely a flagged future discussion, not a change.
+
+    v17 (2026-09-03, Andrew's ask -- a real run crashed here because he had the xlsx
+    open in Excel at 10am, silently losing that run's 5 rows from the sheet even though
+    digest_history.json and the markdown report had already been written): wb.save() is
+    now retried a couple of times a few seconds apart (covers a brief transient lock --
+    antivirus scan, OneDrive sync -- not the common case of Andrew actually having the
+    file open). If it still can't save, this run's `changes` are written to
+    VALIDATION_LOG_PENDING_PATH (plain JSON, paired with their own date_str) instead of
+    being lost, and the function returns without raising -- main() finishes normally,
+    it just logs 0 new rows this run. Every future call to this function (i.e. the next
+    scheduled run) checks that file FIRST and folds any queued rows in ahead of its own
+    `changes`, using each row's own original date, then clears the queue once a save
+    actually succeeds -- so the backlog empties itself out automatically the next time
+    the file is closed, with no manual backfill needed. Costs nothing extra (no API
+    calls, just local disk I/O) and never blocks -- worst case is rows sit queued for
+    however many runs the file stays open, same as this real 5-row backlog did before
+    being backfilled by hand.
+    """
+    import re
     from openpyxl import Workbook, load_workbook
-    from openpyxl.styles import PatternFill
+    from openpyxl.styles import Border, PatternFill, Side
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
+    from openpyxl.formatting.formatting import ConditionalFormattingList
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.worksheet.datavalidation import DataValidation, DataValidationList
+    from openpyxl.utils import get_column_letter
 
     # Light grey fill for "(reminder)" rows -- visually distinct from a real, actionable
-    # entry so an override doesn't accidentally land on a reminder row instead of the
-    # original entry it's re-surfacing (a reminder row is skipped entirely by
-    # apply_validation_overrides.py -- see that script's docstring -- so an override
-    # placed there silently does nothing). Added 2026-08-27 after this happened for
-    # real: Malik Nabers' override was placed on his 8/27 reminder row instead of his
-    # original 8/26 entry.
+    # entry (see the override guardrail below for the stronger fix). A thin border was
+    # added 2026-08-28 (Andrew's ask) -- a solid fill on its own hides Excel's default
+    # gridlines, making it hard to tell where one column ends and the next begins when
+    # scanning across a grey row.
     REMINDER_FILL = PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid")
+    REMINDER_BORDER_SIDE = Side(style="thin", color="BFBFBF")
+    REMINDER_BORDER = Border(left=REMINDER_BORDER_SIDE, right=REMINDER_BORDER_SIDE,
+                              top=REMINDER_BORDER_SIDE, bottom=REMINDER_BORDER_SIDE)
+    NEEDS_REVIEW_FILL = PatternFill(start_color="FFF6CC", end_color="FFF6CC", fill_type="solid")
 
-    rows = []
-    for r in changes:
+    # v11 (2026-08-31, Andrew's ask): flags a fresh row whose player already has a
+    # separate open "(reminder)" row elsewhere in the sheet, so the collision isn't easy to
+    # miss. Kept short (no row number -- row numbers shift on every rewrite and would go
+    # stale) since Andrew already knows to use the player-column filter to find the match.
+    REMINDER_FLAG_PREFIX = "[Already has an open reminder] "
+    REMINDER_FLAG_FONT = InlineFont(b=True)
+
+    PENDING_SINCE_RE = re.compile(r"\s*\(pending since \d{4}-\d{2}-\d{2}\)\s*$")
+
+    def _strip_pending_since(summary) -> str:
+        """Old-format reminder rows (pre-2026-08-28) have '(pending since <date>)'
+        baked into the summary text; new ones don't (the date column carries it
+        instead). Stripped when comparing/migrating so an old-format row and a
+        freshly-generated new-format summary for the same underlying story compare
+        equal instead of looking like a spurious change."""
+        return PENDING_SINCE_RE.sub("", str(summary or ""))
+
+    # v17: fold in any rows queued by a previous run that couldn't save (see docstring)
+    # -- each keeps the date it actually happened on, not today's date_str.
+    queued_with_dates = []
+    if VALIDATION_LOG_PENDING_PATH.exists():
+        queued_with_dates = json.loads(VALIDATION_LOG_PENDING_PATH.read_text())
+    all_with_dates = [(date_str, r) for r in changes] + [
+        (item["date_str"], item["change"]) for item in queued_with_dates
+    ]
+
+    regular_rows = []
+    for row_date, r in all_with_dates:
         headlines = " / ".join(it["headline"] for it in r["items"])
-        rows.append({
-            "date": date_str, "player": r["full_name"], "position": r["position"],
+        regular_rows.append({
+            "date": row_date, "player": r["full_name"], "position": r["position"],
             "team": r["team"] or "", "impact": r["impact"], "tone": r["tone"],
             "long_term": r.get("long_term", False), "summary": r["summary"],
             "headlines": headlines, "correct": "", "andrew_notes": "",
             "override_impact": "", "override_tone": "",
-        })
-    for p in pending_reminders:
-        # "(pending since <date>)" is appended directly to the summary text rather
-        # than living in its own column -- Andrew's call, 2026-08-26: a whole extra
-        # column ate screen space just for a fact that only applies to reminder rows.
-        # The since_date itself is computed by get_pending_reminders(), same as before.
-        summary_with_since = f"{p['summary']} (pending since {p['since_date']})"
-        rows.append({
-            "date": date_str, "player": p["full_name"], "position": p["position"],
-            "team": p["team"] or "", "impact": "PENDING (reminder)", "tone": "",
-            "long_term": "", "summary": summary_with_since, "headlines": "", "correct": "", "andrew_notes": "",
-            "override_impact": "", "override_tone": "",
+            "event_driven": r.get("event_driven", True),
+            # TRIAL (2026-09-02): logged for Andrew's review only -- NOT yet used to
+            # suppress a row. See parse_claude_response / append_validation_log docstring.
+            "new_information": r.get("new_information", True),
         })
 
-    if not rows:
+    # v11: previously bailed out here whenever today had nothing new, which also skipped
+    # the auto-clear pass below on a quiet day -- a resolved reminder would sit stale until
+    # the next day something DID change. Only bail early when there's truly nothing to do
+    # (nothing new AND no existing file to clean up).
+    if not regular_rows and not pending_reminders and not VALIDATION_LOG_PATH.exists():
         return 0
 
     VALIDATION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if VALIDATION_LOG_PATH.exists():
         wb = load_workbook(VALIDATION_LOG_PATH)
         ws = wb.active
+        # Migrate an older workbook that predates a newly-added field (e.g.
+        # event_driven, added 2026-08-27): append any VALIDATION_LOG_FIELDNAMES entry
+        # missing from row 1 as a new header column, so existing files upgrade in
+        # place instead of silently getting an unlabeled trailing column. Safe only
+        # because new fields are always appended at the END of VALIDATION_LOG_FIELDNAMES
+        # (Andrew's ask -- new columns go rightmost, existing layout stays put), so the
+        # resulting header order always matches the field order used below.
+        existing_headers = [c.value for c in ws[1]]
+        for field in VALIDATION_LOG_FIELDNAMES:
+            if field not in existing_headers:
+                ws.cell(row=1, column=len(existing_headers) + 1, value=field)
+                existing_headers.append(field)
     else:
         wb = Workbook()
         ws = wb.active
         ws.append(VALIDATION_LOG_FIELDNAMES)
 
-    for r in rows:
-        row_values = [r[field] for field in VALIDATION_LOG_FIELDNAMES]
-        ws.append(row_values)
-        # Write date as a real date type (not the string) so Excel can't silently
+    date_col = VALIDATION_LOG_FIELDNAMES.index("date") + 1
+    impact_col = VALIDATION_LOG_FIELDNAMES.index("impact") + 1
+
+    def _write_row(row_num: int, r: dict) -> None:
+        for col, field in enumerate(VALIDATION_LOG_FIELDNAMES, start=1):
+            ws.cell(row=row_num, column=col, value=r.get(field))
+        date_val = r["date"]
+        if isinstance(date_val, str):
+            date_val = date.fromisoformat(date_val)
+        elif isinstance(date_val, datetime):
+            date_val = date_val.date()
+        date_cell = ws.cell(row=row_num, column=date_col)
+        date_cell.value = date_val
+        # Write date as a real date type (not a string) so Excel can't silently
         # reformat it into something apply_validation_overrides.py can't parse.
-        date_cell = ws.cell(row=ws.max_row, column=VALIDATION_LOG_FIELDNAMES.index("date") + 1)
-        date_cell.value = date.fromisoformat(r["date"])
         date_cell.number_format = "YYYY-MM-DD"
-        if "reminder" in str(r["impact"]).lower():
+        if "reminder" in str(r.get("impact") or "").lower():
             for c in range(1, len(VALIDATION_LOG_FIELDNAMES) + 1):
-                ws.cell(row=ws.max_row, column=c).fill = REMINDER_FILL
+                cell = ws.cell(row=row_num, column=c)
+                cell.fill = REMINDER_FILL
+                cell.border = REMINDER_BORDER
+
+    # Read every existing data row back by VALUE (matched by header name, same approach
+    # as apply_validation_overrides.py's load_rows) so it can be merged with the newly
+    # generated rows and re-sorted -- see the v9 docstring note above on what this does
+    # and does not preserve.
+    existing_rows = []
+    headers = [c.value for c in ws[1]]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if all(v is None for v in row):
+            continue
+        existing_rows.append(dict(zip(headers, row)))
+
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    # v10 one-time migration: collapse any player with MULTIPLE existing "(reminder)"
+    # rows (left over from the old once-a-day-forever behavior) down to one, keeping
+    # whichever duplicate carries the most of Andrew's own content and refreshing its
+    # summary/date to the most recent of the group (existing_rows preserves the sheet's
+    # prior chronological order, so the group's last item is the most recent).
+    # v11: a player's CURRENT true status per history.json -- used below to auto-clear a
+    # reminder row once the underlying story has actually resolved (Andrew's ask, Option A:
+    # he accepted that a resolved row's note/override is gone with it, not archived).
+    name_to_latest_impact = {
+        rec["full_name"]: rec["entries"][-1]["impact"]
+        for rec in history.values() if rec.get("entries")
+    }
+
+    other_existing = []
+    reminder_groups: dict = {}
+    for r in existing_rows:
+        if "reminder" in str(r.get("impact") or "").lower():
+            reminder_groups.setdefault(r.get("player"), []).append(r)
+        else:
+            other_existing.append(r)
+
+    def _annotation_score(r: dict) -> int:
+        return sum(1 for f in ("correct", "andrew_notes", "override_impact", "override_tone") if r.get(f))
+
+    open_reminders_by_player: dict = {}
+    for player, group in reminder_groups.items():
+        # v11 auto-clear: the story has resolved (player's latest recorded status isn't
+        # PENDING any more, or they've dropped out of history entirely) -- drop the row
+        # rather than carry a stale reminder forward.
+        if name_to_latest_impact.get(player) != "PENDING":
+            continue
+        keeper = max(group, key=_annotation_score) if len(group) > 1 else group[0]
+        latest = group[-1]
+        keeper["summary"] = _strip_pending_since(latest["summary"])
+        keeper["date"] = latest["date"]
+        open_reminders_by_player[player] = keeper
+
+    # v15 (2026-09-02, bug found via a real Malik Nabers row): snapshot the set of
+    # players with a SEPARATE, PRE-EXISTING open reminder BEFORE the upsert loop below
+    # runs. The collision flag below must only fire against this snapshot, not the
+    # post-upsert dict -- a player going PENDING for the very first time gets a regular
+    # row (in `changes`) AND a brand-new reminder row in this SAME call, and checking
+    # post-upsert made that brand-new reminder collide with the row that created it,
+    # flagging "[Already has an open reminder]" on a story that in fact has no separate
+    # reminder anywhere -- it just became one this run. Caught 2026-09-01 in real data:
+    # Nabers' first PENDING classification got flagged against itself; Andrew had
+    # already marked that row incorrect (correct='N') before this was root-caused.
+    pre_existing_reminder_players = set(open_reminders_by_player.keys())
+
+    # v10 upsert: a still-open pending story updates its ONE existing reminder row in
+    # place (summary/date refreshed, Andrew's correct/andrew_notes/override_* left
+    # exactly as they were) instead of adding a new row every day nothing has changed.
+    # Only a player with no existing open reminder row gets a brand new one.
+    new_reminder_count = 0
+    for p in pending_reminders:
+        existing = open_reminders_by_player.get(p["full_name"])
+        if existing is not None:
+            existing["summary"] = p["summary"]
+            existing["date"] = p["since_date"]
+        else:
+            open_reminders_by_player[p["full_name"]] = {
+                "date": p["since_date"], "player": p["full_name"], "position": p["position"],
+                "team": p["team"] or "", "impact": "PENDING (reminder)", "tone": "",
+                "long_term": "", "summary": p["summary"], "headlines": "", "correct": "",
+                "andrew_notes": "", "override_impact": "", "override_tone": "", "event_driven": "",
+            }
+            new_reminder_count += 1
+
+    # v11: flag a fresh regular row when its player ALSO still has a SEPARATE,
+    # PRE-EXISTING open reminder row (post auto-clear above, so a just-resolved story
+    # never gets flagged against itself; pre-upsert snapshot, so a story becoming
+    # PENDING for the first time never gets flagged against the reminder it just
+    # created for itself -- see v15 note above) -- bolded prefix via rich text, see
+    # REMINDER_FLAG_PREFIX above.
+    for r in regular_rows:
+        if r["player"] in pre_existing_reminder_players:
+            r["summary"] = CellRichText(
+                TextBlock(REMINDER_FLAG_FONT, REMINDER_FLAG_PREFIX), str(r["summary"] or "")
+            )
+
+    # Stable sort: every non-reminder row (existing rows in their original order, then
+    # this run's new ones) before every reminder row (same) -- Andrew's ask, 2026-08-27,
+    # so reminders always end up grouped at the true bottom of the whole sheet.
+    merged = other_existing + regular_rows + list(open_reminders_by_player.values())
+    merged.sort(key=lambda r: "reminder" in str(r.get("impact") or "").lower())
+
+    for i, r in enumerate(merged, start=2):
+        _write_row(i, r)
 
     for i, field in enumerate(VALIDATION_LOG_FIELDNAMES, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = VALIDATION_LOG_COLUMN_WIDTHS[field]
@@ -607,11 +1131,78 @@ def append_validation_log(changes: list[dict], pending_reminders: list[dict], da
     # Re-applied on every write (like the column widths/freeze pane above) so it always
     # covers the full current row range, not just whatever it was when the file was
     # first created.
-    last_col_letter = ws.cell(row=1, column=len(VALIDATION_LOG_FIELDNAMES)).column_letter
+    last_col_letter = get_column_letter(len(VALIDATION_LOG_FIELDNAMES))
     ws.auto_filter.ref = f"A1:{last_col_letter}{ws.max_row}"
 
-    wb.save(VALIDATION_LOG_PATH)
-    return len(rows)
+    # "Needs review" highlight (Andrew's ask, 2026-08-27): a live conditional-formatting
+    # rule rather than a one-time fill, so it tracks his edits automatically -- a
+    # non-reminder row highlights while `correct` is still blank and clears the moment
+    # he fills it in, with no extra script run required. Reminder rows are excluded
+    # (their `correct` isn't meant to be filled in the normal case) and already carry
+    # their own grey fill. Cleared and re-added on every write so the range always
+    # covers the full current sheet, not just whatever it was when this rule was first
+    # added.
+    correct_letter = get_column_letter(VALIDATION_LOG_FIELDNAMES.index("correct") + 1)
+    impact_letter = get_column_letter(impact_col)
+    ws.conditional_formatting = ConditionalFormattingList()
+    ws.conditional_formatting.add(
+        f"A2:{last_col_letter}{ws.max_row}",
+        FormulaRule(
+            formula=[f'AND(${correct_letter}2="",ISERROR(SEARCH("reminder",${impact_letter}2)))'],
+            fill=NEEDS_REVIEW_FILL,
+        ),
+    )
+
+    # Override guardrail (Andrew's ask, 2026-08-27): the grey fill alone hasn't stopped
+    # an override from landing on a "(reminder)" row -- happened more than once (see
+    # apply_validation_overrides.py's docstring, and Malik Nabers 2026-08-27). This
+    # rejects it at entry time instead of relying on Andrew remembering the rule: Excel
+    # data validation on override_impact/override_tone that hard-stops any value typed
+    # into those cells on a reminder row. Cleared and re-added on every write so the
+    # range covers the full current sheet.
+    ws.data_validations = DataValidationList()
+    override_impact_letter = get_column_letter(VALIDATION_LOG_FIELDNAMES.index("override_impact") + 1)
+    override_tone_letter = get_column_letter(VALIDATION_LOG_FIELDNAMES.index("override_tone") + 1)
+    dv = DataValidation(
+        type="custom",
+        formula1=f'ISERROR(SEARCH("reminder",${impact_letter}2))',
+        allow_blank=True,
+        showErrorMessage=True,
+        errorStyle="stop",
+        errorTitle="Wrong row for an override",
+        error=('Overrides do not apply on "(reminder)" rows -- apply_validation_overrides.py '
+               "skips them by design. Put this on the player's original entry instead (the "
+               "plain-value row where this status was first classified)."),
+    )
+    dv.add(f"{override_impact_letter}2:{override_tone_letter}{ws.max_row}")
+    ws.add_data_validation(dv)
+
+    # v17: a couple of quick retries covers a brief transient lock; the common real
+    # case (Andrew has the file open in Excel) won't clear in seconds, so this isn't
+    # meant to wait him out -- it's the queue-on-failure below that actually handles that.
+    for attempt in range(3):
+        try:
+            wb.save(VALIDATION_LOG_PATH)
+            break
+        except PermissionError:
+            if attempt == 2:
+                VALIDATION_LOG_PENDING_PATH.write_text(json.dumps(
+                    [{"date_str": row_date, "change": r} for row_date, r in all_with_dates]
+                ))
+                print(
+                    f"WARNING: {VALIDATION_LOG_PATH.name} is open elsewhere (likely in "
+                    f"Excel) -- {len(all_with_dates)} row(s) queued to "
+                    f"{VALIDATION_LOG_PENDING_PATH.name} and will be written automatically "
+                    "on the next run that can save."
+                )
+                return 0
+            time.sleep(3)
+    if VALIDATION_LOG_PENDING_PATH.exists():
+        VALIDATION_LOG_PENDING_PATH.unlink()
+    # Counts brand-new rows only -- a pending story that just refreshed an existing
+    # reminder row in place (v10) isn't a "new" entry the same way a fresh regular row
+    # or a first-time reminder is.
+    return len(regular_rows) + new_reminder_count
 
 
 def main() -> None:
@@ -650,14 +1241,15 @@ def main() -> None:
         print(f"  Merged {merged_count} duplicate item(s) reporting the same player from multiple sources")
 
     client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment (loaded above via .env)
-    results = []
     for group in groups:
         sources = ", ".join(it["source"] for it in group["items"])
         headlines = " / ".join(it["headline"] for it in group["items"])
         team_tag = group["team"] or "FA"
         print(f"  Summarizing ({sources}): {group['full_name']} ({team_tag}-{group['position']}) -- {headlines}")
-        prior_entries = history.get(group["gsis_id"], {}).get("entries", [])
-        results.append(summarize_with_claude(client, group, prior_entries))
+    # v14: one batched call for the whole run instead of one call per player (see
+    # summarize_batch_with_claude docstring) -- falls back to individual calls per
+    # player internally if anything about the batch response can't be trusted.
+    results = summarize_batch_with_claude(client, groups, history)
 
     changes = [r for r in results if is_change(r, history)]
     print(f"  {len(changes)} of {len(results)} are new/changed since last known status")
@@ -672,7 +1264,7 @@ def main() -> None:
     else:
         print("\nNothing new to report (no changes, no unreminded pending items) -- no file written.")
 
-    logged_count = append_validation_log(changes, pending_reminders, today_str)
+    logged_count = append_validation_log(changes, pending_reminders, today_str, history)
     if logged_count:
         print(f"Logged {logged_count} entries to {VALIDATION_LOG_PATH} for review "
               f"(fill in the 'correct' and 'andrew_notes' columns after reading the report)")

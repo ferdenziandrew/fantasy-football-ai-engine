@@ -46,6 +46,7 @@ VALIDATION_LOG_PATH = PROJECT_ROOT / "data" / "processed" / "digest_validation_l
 VALIDATION_LOG_FIELDNAMES = [
     "date", "player", "position", "team", "impact", "tone", "long_term",
     "summary", "headlines", "correct", "andrew_notes", "override_impact", "override_tone",
+    "event_driven",
 ]
 
 # String fallback only -- normally the date column is a real Excel date type (see
